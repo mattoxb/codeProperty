@@ -381,17 +381,13 @@ subst_vars_by_pats_in_clause_cps subst (bnd_pat, e) counter =
    (case subst_vars_by_pats_in_cps_exp subst alpha_e counter' of (newk,newC) -> ((alpha_bnd_pat, newk), newC))
 
 
----- mkValueCPS fun
----mkValueCPS k spec_pat =
--- (case k of FnContCPS gen_pat e ->
---     let subst = )
- -- match k
- -- with FnContCPS (gen_pat, e) ->
-  --  (try
- --      let subst = pat_pat_match gen_pat spec_pat in
- --      subst_vars_by_pats_in_cps_exp subst e
-  --   with _ -> ValueCPS(k, spec_pat))
-  --  | _ -> ValueCPS(k, spec_pat)
+mkValueCPS (k, spec_pat) counter =
+  case k
+  of FnContCPS gen_pat e -> (case pat_pat_match gen_pat spec_pat
+                             of Nothing -> Nothing
+                                Just subst -> 
+                                 (case subst_vars_by_pats_in_cps_exp subst e counter of (newk,newC) -> Just (ValueCPS k spec_pat)))
+     _ -> Just (ValueCPS k spec_pat)
 
 ---- cps transformation
 cpsExp (Var x y) k = k (Var x) 
