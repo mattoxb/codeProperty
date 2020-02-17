@@ -8,6 +8,7 @@ module Lib where
 import Debug.Trace
 import Language.Haskell.Exts
 import Data.IORef
+import Control.Monad
 
 class HasExpChildren a b where
   expChildren :: a -> [Exp b]
@@ -156,9 +157,9 @@ data Const = IntConst Integer | BoolConst Bool | StringConst String |FloatConst 
   | UserDefConst String | NilConst | UnitConst deriving ( Eq, Show, Ord )
 
 data ThisPat = WildPat | ConstPat Const
-  | VarPat String | TuplePat ThisPat ThisPat | ConstrPat String ThisPat deriving ( Eq, Show, Ord )
+  | VarPat String | TuplePat [ThisPat] | ConstrPat String ThisPat deriving ( Eq, Show, Ord )
 
-data ContVar = Kvar Integer deriving ( Eq, Show, Ord )
+data ContVar = Kvar String deriving ( Eq, Show, Ord )
 
 data MonOp = IntNegOp | NotOp deriving ( Eq, Show, Ord )
 
@@ -203,7 +204,8 @@ pat_pat_match gen_pat spec_pat =
       ConstPat c -> (case spec_pat of ConstPat c' -> (if c == c' then Just [] else Nothing)
                                       _ -> Nothing)
       VarPat s -> Just [(s,spec_pat)]
-      TuplePat gp1 gp2 -> (case spec_pat of TuplePat sp1 sp2 -> (pat_pat_match gp1 sp1) >>= (\a -> (pat_pat_match gp2 sp2) >>= (\b -> return (a ++ b))))
+      TuplePat gps -> (case spec_pat 
+                          of TuplePat sps -> foldM (\ l -> \ (gp1,sp1) -> pat_pat_match gp1 sp1 >>= (\a -> return (l ++ a))) [] (zip gps sps))
       ConstrPat c gpat -> (case spec_pat
                              of ConstrPat c' spat ->
                                     (if c == c' then pat_pat_match gpat spat else Nothing)
@@ -222,7 +224,7 @@ varsInPat pat =
   case pat of { WildPat -> []
     ; ConstPat _ -> []
     ; VarPat s -> [s]
-    ; TuplePat p1 p2 -> ((varsInPat p1) ++ (varsInPat p2))
+    ; TuplePat ps -> (foldl (\ l -> \a -> (varsInPat a) ++ l) [] ps)
     ; ConstrPat c p -> varsInPat p}
 
 ----map_rm fun
@@ -257,14 +259,14 @@ map_find f x =
     [] -> Nothing
     (a, b):r -> (if x == a then Just b else map_find r x)
 
-fresh counter = (show counter, counter + 1)
+fresh counter = ("%"++(show counter), counter + 1)
 
 swap_vars_in_pat x y pat =
   case pat
   of WildPat -> WildPat 
      ConstPat c -> pat
      VarPat s -> VarPat (if s == x then y else if s == y then x else s)
-     TuplePat p1 p2 -> TuplePat (swap_vars_in_pat x y p1) (swap_vars_in_pat x y p2)
+     TuplePat ps -> TuplePat (map (\a -> swap_vars_in_pat x y a) ps)
      ConstrPat c p -> ConstrPat c (swap_vars_in_pat x y p)
 
 replace_var_in_pat x y pat =
@@ -272,7 +274,7 @@ replace_var_in_pat x y pat =
   of WildPat -> WildPat
      ConstPat c -> pat
      VarPat s -> VarPat (if s == x then y else s)
-     TuplePat p1 p2  -> TuplePat (replace_var_in_pat x y p1) (replace_var_in_pat x y p2)
+     TuplePat ps  -> TuplePat (map (\a -> replace_var_in_pat x y a) ps)
      ConstrPat c p -> ConstrPat c (replace_var_in_pat x y p)
 
 swap_vars_in_cps_cont x y k =
@@ -319,8 +321,8 @@ replace_var_in_cps_exp x y e = (
          AppCPS (replace_var_in_cps_cont x y k) (if r == x then y else r) (replace_var_in_pat x y s)
      FunCPS k p kv e -> 
           (case replace_var_in_clause_cps x y (p,e) of (p',e') -> FunCPS (replace_var_in_cps_cont x y k) p' kv e')
-     FixCPS k f p kv e -> (case replace_var_in_clause_cps x y (TuplePat (VarPat f) p, e)
-                              of (TuplePat  (VarPat f') p' , e') ->
+     FixCPS k f p kv e -> (case replace_var_in_clause_cps x y (TuplePat [(VarPat f), p], e)
+                              of (TuplePat  [(VarPat f'), p'] , e') ->
                                                    FixCPS (replace_var_in_cps_cont x y k) f' p' kv e'))
 replace_var_in_clause_cps x y (pat, e) = 
   let pat_vars = varsInPat pat
@@ -344,9 +346,7 @@ subst_vars_by_pats_in_pat subst gen_pat =
      ConstPat c -> gen_pat
      VarPat s -> (case map_find subst s of Nothing -> gen_pat
                                            Just spec_pat -> spec_pat)
-     TuplePat p1 p2 ->
-      TuplePat (subst_vars_by_pats_in_pat subst p1)
-                (subst_vars_by_pats_in_pat subst p2)
+     TuplePat ps -> TuplePat (map (\a -> subst_vars_by_pats_in_pat subst a) ps)
      ConstrPat c p -> ConstrPat c (subst_vars_by_pats_in_pat subst p)
 
 ---subst_vars_by_pats_in_cps_cont
@@ -375,8 +375,8 @@ subst_vars_by_pats_in_cps_exp subst e counter =
        ;FunCPS k p kv e -> (case subst_vars_by_pats_in_clause_cps subst (p,e) counter
                               of ((p',e'),newCounter) -> (case subst_vars_by_pats_in_cps_cont subst k newCounter
                                                         of (newk,newC) -> (FunCPS newk p' kv e',newC)))
-       ;FixCPS k f p kv e -> (case subst_vars_by_pats_in_clause_cps subst (TuplePat (VarPat f) p, e) counter
-          of ((TuplePat (VarPat f') p', e'),newC) -> (case subst_vars_by_pats_in_cps_cont subst k newC
+       ;FixCPS k f p kv e -> (case subst_vars_by_pats_in_clause_cps subst (TuplePat [(VarPat f), p], e) counter
+          of ((TuplePat [(VarPat f'), p'], e'),newC) -> (case subst_vars_by_pats_in_cps_cont subst k newC
                                                         of (newkk,newCC) -> (FixCPS newkk f' p' kv e',newCC)))}
 ---subst_vars_by_pats_in_clause_cps
 subst_vars_by_pats_in_clause_cps subst (bnd_pat, e) counter =
@@ -396,6 +396,25 @@ mkValueCPS (k, spec_pat) counter =
                                 Just subst -> 
                                  (case subst_vars_by_pats_in_cps_exp subst e counter of (newk,newC) -> Just (ValueCPS k spec_pat)))
      _ -> Just (ValueCPS k spec_pat)
+
+---transfer patterns to CPS patterns
+transPat (PVar x (Ident y u)) = VarPat u
+transPat ((PLit x  s (Int y u v))) = ConstPat (IntConst u)
+transPat ((PLit x s (String y u v))) = ConstPat (StringConst u)
+transPat ((PLit x s (Char y u v))) = ConstPat (CharConst u)
+transPat ((PLit x s (Frac y u v))) = ConstPat (FloatConst u)
+transPat ((PTuple x y el)) = TuplePat (map (\a -> transPat a) el)
+transPat ((PList x [])) = ConstrPat "[]" WildPat
+transPat ((PList x (y:ys))) = ConstrPat ":" (TuplePat [transPat y, transPatList ys])
+transPat ((PInfixApp x e1 (UnQual y (Ident z name)) e2)) = ConstrPat name (TuplePat [transPat e1, transPat e2])
+transPat ((PApp x (UnQual y (Ident z name)) el)) = ConstrPat name (TuplePat (map (\e -> transPat e) el))
+transPat (PParen x y) = transPat y
+transPat (PWildCard x) = WildPat
+
+transPatList [] = ConstrPat "[]" WildPat
+transPatList (y:ys) = ConstrPat ":" (TuplePat [transPat y, transPatList ys])
+
+transPatTop l = TuplePat (map (\a -> transPat a) l)
 
 ---- cps transformation
 cpsExp exp k counter = 
@@ -422,7 +441,143 @@ cpsExp exp k counter =
                 {(Just e3cps,newCCC) -> cpsExp e1 (FnContCPS (VarPat v) (MatchCPS (VarPat v) [(ConstPat (BoolConst True), e2cps), (ConstPat (BoolConst False), e3cps)])) newCCC
                  ; (_,newCCC) -> (Nothing, newCCC)})
                 ; (_,newCC) -> (Nothing, newCC)})})
+        ; Lambda x p e -> (case fresh counter of 
+             {(v,newC) -> (case cpsExp e (ContVarCPS (Kvar v)) newC
+                              of (Just ecps, newCC) -> (Just (FunCPS k (transPatTop p) (Kvar v) ecps), newCC)
+                                 (Nothing, newCC) -> (Nothing, newCC))})
+        ; Tuple x y u -> cpsExps u k [] counter
 }
+
+cpsExps [] k acc counter = ( (mkValueCPS (k, TuplePat acc) counter), counter)
+cpsExps (y:ys) k acc counter = (case fresh counter
+                                  of (v, newC) -> (case cpsExps ys k (acc++[VarPat v]) newC
+                                                    of (Just ecps, newCC) -> (case cpsExp y (FnContCPS (VarPat v) ecps) newCC
+                                                                               of (Just new,newCCC) -> (Just new, newCCC)
+                                                                                  (_,newCCC) -> (Nothing, newCCC))
+                                                       (_, newCC) -> (Nothing, newCC)))
+
+cpsDec (FunBind x ((Match y (Ident u v) ps rhs may):xs)) =
+    (case cpsRhs rhs of Nothing -> Nothing
+                        Just (newe,newC) -> Just (v, transPatTop ps, newe, may, newC))
+cpsDec _ = Nothing
+
+cpsRhs (UnGuardedRhs x e) = (case cpsExp e External 0 of (Nothing,newC)-> Nothing
+                                                         (Just e,newC) -> Just (e,newC))
+
+
+----- check tail recursion
+is_tail_call f kv k = 
+  case k
+  of  External -> False
+      ContVarCPS kv' -> (kv == kv')
+      FnContCPS (VarPat g) (AppCPS k' g' pat) -> ((g == g') && ((k' == ContVarCPS kv) || is_tail_call g' kv k'))
+      FnContCPS _ _ -> False
+
+only_tail_recursion_in_cont_cps fs kv k counter =
+   case k of External -> True
+             ContVarCPS _ -> True
+             FnContCPS p e -> (only_tail_recursion_in_clause_cps fs kv (p, e) counter)
+  
+only_tail_recursion_in_cps_exp fs kv exp_cps counter = 
+  case exp_cps of
+      {ValueCPS k p ->
+       (all (\ f -> (not (elem f (varsInPat p)))) fs) &&
+            only_tail_recursion_in_cont_cps fs kv k counter
+      ;MonOpAppCPS k m p ->
+      (only_tail_recursion_in_cont_cps fs kv k counter) &&
+        (all (\ f -> (not (elem f (varsInPat p)))) fs)
+      ;BinOpAppCPS k b p1 p2 ->
+      (only_tail_recursion_in_cont_cps fs kv k counter) &&
+        (all (\ f -> (not (elem f (varsInPat p1)))) fs) &&
+        (all (\ f -> (not (elem f (varsInPat p2)))) fs)
+      ;MatchCPS s kcls ->
+      (all (\ f -> (not (elem f (varsInPat s)))) fs) &&
+      (all
+         (\ kcl -> (only_tail_recursion_in_clause_cps fs kv kcl counter))
+         kcls)
+      ;AppCPS k r pat ->
+      (if (elem r fs) then (is_tail_call r kv k) else (only_tail_recursion_in_cont_cps fs kv k counter))
+      ;FunCPS k p kvar e ->
+      ((only_tail_recursion_in_clause_cps fs kvar (p,e) counter) &&
+       (only_tail_recursion_in_cont_cps fs kv k counter))
+      ;FixCPS k g p kvar e ->
+      ((only_tail_recursion_in_clause_cps (g:fs) kvar (p, e) counter) &&
+       (only_tail_recursion_in_cont_cps fs kv k counter))}
+
+only_tail_recursion_in_clause_cps fs kv (bnd_pat, e) counter =
+  let capture_vars = filter (\ v -> elem v fs) (varsInPat bnd_pat) in
+  let (alpha_bnd_pat, alpha_e,newC) = rename_away_clause_cps capture_vars (bnd_pat, e) counter in
+    (only_tail_recursion_in_cps_exp fs kv alpha_e newC)
+
+check_tail d = (case cpsDec d of Nothing -> False 
+                                 Just (v, ps, newe, may, newC) -> only_tail_recursion_in_cps_exp [v] (Kvar "0") newe newC)
+
+
+--- getting free variables
+freeVarsInExpCPS cont =
+    case
+ cont of ValueCPS k x -> merge (varsInPat x) (freeVarsInContCPS k)
+         MonOpAppCPS k m s ->  merge (varsInPat s) (freeVarsInContCPS k)
+         BinOpAppCPS k b r s -> merge (varsInPat r) (merge (varsInPat s) (freeVarsInContCPS k))
+         MatchCPS  r kcls -> merge (varsInPat r) (foldr (\ kcl l -> merge (freeVarsInClauseCPS kcl) l) [] kcls)
+         AppCPS k x1 x2 -> merge [x1] (merge (varsInPat x2) (freeVarsInContCPS k))
+         FunCPS k x kv e -> merge (freeVarsInContCPS k) (freeVarsInClauseCPS (x,e))
+         FixCPS k f x kv e -> merge (freeVarsInContCPS k) (freeVarsInClauseCPS (TuplePat [VarPat f, x], e))
+freeVarsInClauseCPS (pat, k) =
+  let pat_vars = varsInPat pat
+  in filter (\ v -> not(elem v pat_vars)) (freeVarsInExpCPS k )
+freeVarsInContCPS k =
+   case k of
+     External -> []
+     ContVarCPS _ -> []
+     FnContCPS p e -> (freeVarsInClauseCPS (p, e))
+
+--- checking forward recursion
+check_rec_fun_fun_match_app f exp_cps counter = 
+  case exp_cps
+  of {ValueCPS k x -> not(elem f (freeVarsInContCPS k))
+     ; MonOpAppCPS k m s ->
+      not((elem f (varsInPat s)) || (elem f (freeVarsInContCPS k)))
+     ; BinOpAppCPS k b r s ->
+      not((elem f (varsInPat r)) || (elem f (varsInPat s)) ||
+             (elem f (freeVarsInContCPS k)))
+     ; MatchCPS  r kcls ->
+      (not(elem f (varsInPat r)) &&
+         (all (\a -> check_rec_fun_clause_fun_match_app f a counter) kcls))
+     ; AppCPS k x1 x2 ->
+      not((elem f (varsInPat x2)) || (elem f (freeVarsInContCPS k)))
+     ; FunCPS k p kv e ->
+      (not(elem f (freeVarsInContCPS k))) &&
+        (check_rec_fun_clause_fun_match_app f (p,e) counter)
+     ; FixCPS k g p kv e ->
+      (not(elem f (freeVarsInContCPS k))) &&
+        ((g == f) || (check_rec_fun_clause_fun_match_app f (p,e) counter)) }
+
+check_rec_fun_clause_fun_match_app f (p,e) counter =
+  let (_, alpha_e, newC) = rename_away_clause_cps [f] (p, e) counter in
+  check_rec_fun_fun_match_app f alpha_e newC
+
+only_forward_recursion_in_cps_exp exp_cps counter =
+  case exp_cps
+  of  ValueCPS k x -> only_forward_recursion_in_cont_cps k counter
+      MonOpAppCPS k m s -> only_forward_recursion_in_cont_cps k counter
+      BinOpAppCPS k b r s -> only_forward_recursion_in_cont_cps k counter
+      MatchCPS r kcls -> all (\a -> only_forward_recursion_in_clause_cps a counter) kcls 
+      AppCPS k x1 x2 -> only_forward_recursion_in_cont_cps k counter
+      FunCPS k p kv e -> only_forward_recursion_in_cont_cps k counter && (only_forward_recursion_in_clause_cps (p, e) counter)
+      FixCPS k f p kv e -> (only_forward_recursion_in_cont_cps k counter) && 
+                             (only_forward_recursion_in_clause_cps (p, e) counter) &&
+                                 (check_rec_fun_clause_fun_match_app f (p,e) counter)
+only_forward_recursion_in_cont_cps k counter =
+  case k of External -> True
+            ContVarCPS _ -> True
+            FnContCPS p e -> (only_forward_recursion_in_clause_cps (p, e) counter)
+only_forward_recursion_in_clause_cps (bnd_pat, e) counter =
+  only_forward_recursion_in_cps_exp e counter
+
+check_forward d = (case cpsDec d of Nothing -> False 
+                                    Just (v, ps, newe, may, newC) -> only_forward_recursion_in_cps_exp newe newC)
+
 
 factp :: Decl ()
 factp =
