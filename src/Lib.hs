@@ -152,13 +152,13 @@ makeCounter = do
                        readIORef r)
 
 
-data Const = IntConst Int | BoolConst Bool | StringConst String |FloatConst Float
+data Const = IntConst Integer | BoolConst Bool | StringConst String |FloatConst Rational | CharConst Char
   | UserDefConst String | NilConst | UnitConst deriving ( Eq, Show, Ord )
 
 data ThisPat = WildPat | ConstPat Const
   | VarPat String | TuplePat ThisPat ThisPat | ConstrPat String ThisPat deriving ( Eq, Show, Ord )
 
-data ContVar = Kvar Int deriving ( Eq, Show, Ord )
+data ContVar = Kvar Integer deriving ( Eq, Show, Ord )
 
 data MonOp = IntNegOp | NotOp deriving ( Eq, Show, Ord )
 
@@ -208,6 +208,15 @@ pat_pat_match gen_pat spec_pat =
                              of ConstrPat c' spat ->
                                     (if c == c' then pat_pat_match gpat spat else Nothing)
                                 _ -> Nothing)
+
+getBinOp s = if s == "==" then EqOp else if s == "+" then IntPlusOp else if s == "-" then IntMinusOp
+             else if s == "*" then IntTimesOp else if s == "/" then IntDivOp
+             else if s == ":" then ListCatOp else if s == "++" then StringCatOp
+             else if s == ">" then GtOp else if s == "<" then LtOp
+             else if s == ">=" then GeOp else if s == "<=" then LeOp
+             else if s == "/=" then NeqOp else if s == "&&" then AndOp
+             else if s == "||" then OrOp else SeqOp
+
 ---varsInPat function
 varsInPat pat =
   case pat of { WildPat -> []
@@ -380,7 +389,6 @@ subst_vars_by_pats_in_clause_cps subst (bnd_pat, e) counter =
   in
    (case subst_vars_by_pats_in_cps_exp subst alpha_e counter' of (newk,newC) -> ((alpha_bnd_pat, newk), newC))
 
-
 mkValueCPS (k, spec_pat) counter =
   case k
   of FnContCPS gen_pat e -> (case pat_pat_match gen_pat spec_pat
@@ -390,7 +398,31 @@ mkValueCPS (k, spec_pat) counter =
      _ -> Just (ValueCPS k spec_pat)
 
 ---- cps transformation
-cpsExp (Var x y) k = k (Var x) 
+cpsExp exp k counter = 
+   case exp
+     of { (Var x (UnQual y (Ident u v))) -> (mkValueCPS (k, VarPat v) counter, counter)
+        ; (Lit x (Int y u v)) -> (mkValueCPS (k, ConstPat (IntConst u)) counter, counter)
+        ; (Lit x (String y u v)) -> (mkValueCPS (k, ConstPat (StringConst u)) counter, counter)
+        ; (Lit x (Char y u v)) -> (mkValueCPS (k, ConstPat (CharConst u)) counter, counter)
+        ; (Lit x (Frac y u v)) -> (mkValueCPS (k, ConstPat (FloatConst u)) counter, counter)
+        ; InfixApp a e1 (QVarOp x (UnQual y (Symbol z u))) e2
+               -> (case fresh counter of {(v2,newC) -> case fresh newC of
+                      {(v1,newCC) -> case cpsExp e1 (FnContCPS (VarPat v1) (BinOpAppCPS k (getBinOp u) (VarPat v1) (VarPat v2))) newCC
+                                   of {(Just e1CPS, newCCC) -> cpsExp e2 (FnContCPS (VarPat v2) e1CPS) newCCC
+                                        ; (_,newC') -> (Nothing, newC') }}})
+        ; NegApp x e -> (case fresh counter of (v,newC) -> cpsExp e (FnContCPS (VarPat v) (MonOpAppCPS k IntNegOp (VarPat v))) newC)
+        ; App x e1 e2 -> (case fresh counter of {(v2,newC) -> case fresh newC of
+                      {(v1,newCC) -> case cpsExp e1 (FnContCPS (VarPat v1) (AppCPS k v1 (VarPat v2))) newCC
+                                   of {(Just e1CPS, newCCC) -> cpsExp e2 (FnContCPS (VarPat v2) e1CPS) newCCC
+                                     ; (_,newC') -> (Nothing, newC') }}})
+        ; Paren x e -> cpsExp e k counter
+        ; If x e1 e2 e3 -> (case fresh counter of
+             {(v,newC) -> (case cpsExp e2 k newC of
+               {(Just e2cps, newCC) -> (case cpsExp e3 k newCC of 
+                {(Just e3cps,newCCC) -> cpsExp e1 (FnContCPS (VarPat v) (MatchCPS (VarPat v) [(ConstPat (BoolConst True), e2cps), (ConstPat (BoolConst False), e3cps)])) newCCC
+                 ; (_,newCCC) -> (Nothing, newCCC)})
+                ; (_,newCC) -> (Nothing, newCC)})})
+}
 
 factp :: Decl ()
 factp =
