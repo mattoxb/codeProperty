@@ -397,6 +397,13 @@ mkValueCPS (k, spec_pat) counter =
                                  (case subst_vars_by_pats_in_cps_exp subst e counter of (newk,newC) -> Just (ValueCPS k spec_pat)))
      _ -> Just (ValueCPS k spec_pat)
 
+collectToTuple [] = []
+collectToTuple ((Match y (Ident u v) ps rhs may):xs) = (transPatTop ps,rhs):(collectToTuple xs)
+
+collectMays [] = []
+collectMays ((Match y (Ident u v) ps rhs may):xs) = case may of Nothing -> (collectMays xs)
+                                                                Just ma -> ma:(collectMays xs)
+
 ---transfer patterns to CPS patterns
 transPat (PVar x (Ident y u)) = VarPat u
 transPat ((PLit x  s (Int y u v))) = ConstPat (IntConst u)
@@ -435,6 +442,9 @@ cpsExp exp k counter =
                                    of {(Just e1CPS, newCCC) -> cpsExp e2 (FnContCPS (VarPat v2) e1CPS) newCCC
                                      ; (_,newC') -> (Nothing, newC') }}})
         ; Paren x e -> cpsExp e k counter
+        ; Case x e clauses -> (case fresh counter of {(r,newC) -> case cpsClauses clauses k newC of
+                                           {Just (newk,newCC) -> cpsExp e (FnContCPS (VarPat r) (MatchCPS (VarPat r) newk)) newCC 
+                                            ; _ -> (Nothing, counter)}})
         ; If x e1 e2 e3 -> (case fresh counter of
              {(v,newC) -> (case cpsExp e2 k newC of
                {(Just e2cps, newCC) -> (case cpsExp e3 k newCC of 
@@ -448,6 +458,31 @@ cpsExp exp k counter =
         ; Tuple x y u -> cpsExps u k [] counter
 }
 
+cps_clause (Alt x pat rhs may) k counter =  (case cpsRhs rhs k counter of Just (newk,newC) -> Just ((transPat pat, newk),newC)
+                                                                          _ -> Nothing)
+cpsClauses clauses k counter =
+  case clauses of [] -> Just ([],counter)
+                  cl : cls -> case cps_clause cl k counter of {
+                         Just (newk,newC) -> 
+                                 case cpsClauses cls k newC of Just (newkl,newCC) -> Just (newk:newkl,newCC)
+                                                               _ -> Nothing
+                       ; _ -> Nothing}
+
+cpsRhs (UnGuardedRhs x e) k counter = case cpsExp e k counter of {(Nothing, newC) -> Nothing
+                                                                 ;(Just ea, newC) -> Just (ea, newC)}
+cpsRhs (GuardedRhss x []) k counter = Nothing
+cpsRhs (GuardedRhss x [GuardedRhs y stmts e]) k counter = case cpsExp e k counter of (Just newe,newC) -> Just (newe,newC)
+                                                                                     (_,newC) -> Nothing
+cpsRhs (GuardedRhss x ((GuardedRhs y stmts e):(z:xs))) k counter = 
+   case fresh counter of {(v,newC) -> case cpsExp e k newC of
+           {(Just e2cps,newCC) -> case cpsRhs (GuardedRhss x (z:xs)) k newCC of 
+                     {Just (e3cps, newCCC) -> cpsStmts stmts (FnContCPS (VarPat v) (MatchCPS (VarPat v) [(ConstPat (BoolConst True), e2cps), (ConstPat (BoolConst False), e3cps)])) newCCC
+                      ; _ -> Nothing}
+            ; (_,newCC) -> Nothing}}
+
+cpsStmts x k counter = case mkValueCPS (k, ConstPat (BoolConst True)) counter of Just ea -> Just (ea,counter)
+                                                                                 _ -> Nothing
+
 cpsExps [] k acc counter = ( (mkValueCPS (k, TuplePat acc) counter), counter)
 cpsExps (y:ys) k acc counter = (case fresh counter
                                   of (v, newC) -> (case cpsExps ys k (acc++[VarPat v]) newC
@@ -456,13 +491,46 @@ cpsExps (y:ys) k acc counter = (case fresh counter
                                                                                   (_,newCCC) -> (Nothing, newCCC))
                                                        (_, newCC) -> (Nothing, newCC)))
 
-cpsDec (FunBind x ((Match y (Ident u v) ps rhs may):xs)) =
-    (case cpsRhs rhs of Nothing -> Nothing
-                        Just (newe,newC) -> Just (v, transPatTop ps, newe, may, newC))
-cpsDec _ = Nothing
+cpsDec (FunBind x ((Match y (Ident u v) ps rhs may):xs)) k counter =
+     let (v1,newC) = fresh counter in
+     let (v2,newCC) = fresh newC in
+          case cpsClausesA (collectToTuple ((Match y (Ident u v) ps rhs may):xs)) k newCC
+            of Nothing -> Nothing
+               Just (newk,newCCC) -> case mkValueCPS (FnContCPS (VarPat v1) (MatchCPS (VarPat v1) newk), VarPat v2) counter
+                                       of {Nothing -> Nothing  
+                                          ;(Just newe) -> 
+                         case cpsWheres (collectMays ((Match y (Ident u v) ps rhs may):xs)) k [] newCCC
+                            of {Nothing -> Nothing
+                                ; Just (newkl,newC4) -> Just ((v,newe,newkl),newC4)}}
 
-cpsRhs (UnGuardedRhs x e) = (case cpsExp e External 0 of (Nothing,newC)-> Nothing
-                                                         (Just e,newC) -> Just (e,newC))
+cpsDec _ k counter = Nothing  
+
+
+cpsWheres [] k acc counter = Just (acc,counter)
+cpsWheres (x:xs) k acc counter = case cpsBinds x k counter of Nothing -> Nothing
+                                                              Just (kl,newC) -> cpsWheres xs k (acc++kl) newC
+
+cpsBindsAux [] k counter = Just ([],counter)
+cpsBindsAux (x:xs) k counter = case cpsDec x k counter of Nothing -> Nothing
+                                                          Just ((v,newe,newkl),newC) ->
+                                                                    (case cpsBindsAux xs k newC 
+                                                                       of Nothing -> Nothing
+                                                                          Just (l,newCC) -> Just ((v,newe,newkl):l,newCC))
+
+cpsBinds (BDecls x dl) k counter = cpsBindsAux dl k counter
+
+cpsBinds _ k counter = Nothing
+
+cps_clauseA (pat,rhs) k counter =  case cpsRhs rhs k counter of Just (newk,newC) -> Just ((pat, newk),newC)
+                                                                _ -> Nothing
+
+cpsClausesA clauses k counter = 
+  case clauses of [] -> Just ([],counter)
+                  cl : cls -> case cps_clauseA cl k counter of {
+                         Just (newk,newC) ->  case cpsClausesA cls k newC of {Just (newkl,newCC) -> Just (newk:newkl,newCC)
+                                                                              ; _ -> Nothing}
+                       ; _ -> Nothing}
+
 
 
 ----- check tail recursion
@@ -509,8 +577,12 @@ only_tail_recursion_in_clause_cps fs kv (bnd_pat, e) counter =
   let (alpha_bnd_pat, alpha_e,newC) = rename_away_clause_cps capture_vars (bnd_pat, e) counter in
     (only_tail_recursion_in_cps_exp fs kv alpha_e newC)
 
-check_tail d = (case cpsDec d of Nothing -> False 
-                                 Just (v, ps, newe, may, newC) -> only_tail_recursion_in_cps_exp [v] (Kvar "0") newe newC)
+checkTailAux (v,newe,may) counter = only_tail_recursion_in_cps_exp [v] (Kvar "0") newe counter
+           && foldl (\ b -> \next -> b && checkTailAux next counter) True may
+
+check_tail d =  case cpsDec d (ContVarCPS (Kvar "0")) 1
+                  of Nothing -> False 
+                     Just ((v, newe, may), newC) -> checkTailAux (v, newe, may) newC
 
 
 --- getting free variables
@@ -575,8 +647,12 @@ only_forward_recursion_in_cont_cps k counter =
 only_forward_recursion_in_clause_cps (bnd_pat, e) counter =
   only_forward_recursion_in_cps_exp e counter
 
-check_forward d = (case cpsDec d of Nothing -> False 
-                                    Just (v, ps, newe, may, newC) -> only_forward_recursion_in_cps_exp newe newC)
+
+checkForwardAux (v,newe,may) counter = only_forward_recursion_in_cps_exp newe counter && foldl (\ b -> \next -> b && checkForwardAux next counter) True may
+
+check_forward d =  case cpsDec d (ContVarCPS (Kvar "0")) 1
+                     of Nothing -> False 
+                        Just ((v, newe, may), newC) -> checkForwardAux (v, newe, may) newC
 
 
 factp :: Decl ()
