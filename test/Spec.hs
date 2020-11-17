@@ -64,9 +64,9 @@ factorialExamplesAreRecursive = testCase "factorial examples" $ do
 
 checkRecursiveIsAggressive :: TestTree
 checkRecursiveIsAggressive = testCase "unused binding" $ do
-  assertBool "recursion check was fooled by a simple unused binding" $
+  assertBool "recursion check didn't see simple unused binding" $
     checkRecursive ex1
-  assertBool "recursion check was fooled by complex unused bindings" $
+  assertBool "recursion check didn't see complex unused bindings" $
     checkRecursive ex2
   where ex1 = unlines [ "fact n = product [1..n]"
                       , "  where _ = fact n" ]
