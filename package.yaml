@@ -23,6 +23,7 @@ dependencies:
 - base >= 4.7 && < 5
 - haskell-src-exts
 - lens
+- mtl
 
 library:
   source-dirs: src
@@ -48,3 +49,6 @@ tests:
     - -with-rtsopts=-N
     dependencies:
     - codeProperty
+    - haskell-src-exts
+    - tasty
+    - tasty-hunit
