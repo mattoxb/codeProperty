@@ -23,11 +23,14 @@ data SimpleExp = Const | Var Name
 -- We don't care about the transform being exactly correct in terms
 -- of the shapes of patterns (esp. w.r.t to how functions are actually
 -- applied) because we're never going to run the code. But we _do_ need
--- to know the names of the binders in lambdas 
+-- to know the names of the binders in lambdas. Thus it's OK to, for
+-- example, translate [1, 2, x] as 
+-- ConstrPat "[]" [ConstPat, ConstPat, VarPat "x"].
 data CpsPat
-  = WildPat
-  | ConstPat -- we don't really care about constant values
+  = ConstPat -- we don't really care about constant values
+             -- wildcard pattern is a ConstPat too
   | VarPat Name
+  | AsPat  Name CpsPat
   | TuplePat (NonEmpty CpsPat) -- in fact there are always >= 2
   | ConstrPat String [CpsPat] -- constructor name is needed?
     -- pattern "()" needs to be translated as ConstrPat "()" []
@@ -49,7 +52,7 @@ data CpsExp
   | BinOpAppCps SimpleExp Op SimpleExp CpsCont
   | MatchCps SimpleExp [(CpsPat, CpsExp)]
   | AppCps SimpleExp SimpleExp CpsCont
-  | FunCps CpsPat ContVar CpsExp CpsCont
+  | LamCps CpsPat ContVar CpsExp CpsCont
   deriving Eq
 
 -------------------------------------------------------------------------------
@@ -108,7 +111,7 @@ asSimpleExp e | isSimple e = Const
 -- That's mostly useful for debugging.
 --
 -- E.X. 'cpsExp (-e) k' can be expressed as
---  cpsValueM e $ \se -> pure (AppCps (Var "negate") se k)
+--  cpsValueM e "v" $ \se -> pure (AppCps (Var "negate") se k)
 -- If 'e' is constant this would give AppCps (Var "negate") Const k.
 -- If 'e' were, say, 'f x', this would give
 --   AppCps (Var "f") (Var "x") $ FN v%1 -> AppCps (Var "negate") (Var v%1) k.
@@ -135,29 +138,112 @@ cases should not arise.
 
 -- | Monadic CPS Transformation. I haven't written down a formalization
 -- of the specific CPS transformation being used, perhaps I should.
+-- It isn't semantics preserving; continuations are passed to partial
+-- applications in places where they aren't added to function definitions,
+-- etc. The important thing is that it does preserve order of evaluation,
+-- if the Haskell code were actually code in a strict language like OCaml.
 cpsExp :: HS.Exp ann -> CpsCont -> CPSM CpsExp
 -- covers HS.Var, HS.Lit, HS.List [], '()', and HS.Con
 cpsExp e k | isSimple e = pure $ SimpleExpCps (asSimpleExp e) k
 cpsExp (HS.OverloadedLabel _ _) _ = unsupported "overloaded label syntax"
 cpsExp (HS.IPVar _ _) _ = unsupported "implicit parameters"
+
 cpsExp (HS.InfixApp _ e1 bigName e2) k = 
-  cpsValueM e2 "v" $ \v1 -> -- right-to-left evaluation does e2 first
-    cpsValueM e1 "v" $ \v2 -> 
+  cpsValueM e2 "v" $ \v2 -> -- right-to-left evaluation does e2 first
+    cpsValueM e1 "v" $ \v1 -> 
       return $ BinOpAppCps v1 name v2 k
   where name = flatName bigName
-cpsExp (HS.App _ f arg) k = -- this is too naive, we need to collect _all_ the
-                            -- arguments in advance, CPS the function + args,
-                            -- then apply everything all at once.
-                            -- otherwise 'foo 1 (2 + 3)' doesn't appear as a
-                            -- tail-call to 'foo', because the work of '(2+3)'
-                            -- is done after the application 'foo 1'.
-  cpsValueM f "f" $ \f1 ->
-    cpsValueM arg "e" $ \e1 ->
-      return $ AppCps f1 e1 k
-cpsExp (HS.NegApp _ e) k = cpsValue e "v" (\se -> AppCps (Var "negate") se k)
-cpsExp (HS.Lambda _ pats body) k = undefined -- need pats
+
+cpsExp app@(HS.App _ _ _) k = rebuildApp head args k
+  where (head, args) = collectApp app
+
+cpsExp (HS.NegApp _ e) k = cpsValue e "v" $ \se -> 
+  AppCps (Var "Prelude.negate") se k
+
+cpsExp (HS.Lambda _ pats body) k = do
+  kvar <- freshKVar
+  -- we don't care about how many syntactic arguments the lambda has,
+  -- but we do care about what names are present in their patterns
+  let cpsPat = asCpsPat $ HS.PTuple undefined HS.Boxed pats
+  cpsBody <- cpsExp body $ VarCont kvar
+  return $ LamCps cpsPat kvar cpsBody k
+
+cpsExp HS.Let{} k = unsupported "let expression (support coming soon! ^hopefullytm)"
+
+cpsExp (HS.If _ b t f) k = do
+  cpsT <- cpsExp t k
+  cpsF <- cpsExp f k
+  cpsValue b "b" $ \se ->
+    MatchCps se [ (ConstPat, cpsT)
+                , (ConstPat, cpsF)
+                ]
 
 cpsExp (HS.Paren _ e) k = cpsExp e k
+
+-- | Collect an application tree into an application head
+-- and a list of argument expressions. The arguments appear
+-- from RIGHT TO LEFT. This is natural for a right-to-left
+-- evaluation order.
+collectApp :: HS.Exp ann -> (HS.Exp ann, [HS.Exp ann])
+collectApp exp = go exp
+  where go (HS.App _ left arg) = let (f, args) = go left
+                                 in (f, arg : args)
+        go (HS.Paren _ e) = go e
+        go other = (other, [])
+
+-- | Reconstruct a collected HS.App into an AppCps tree.
+rebuildApp :: HS.Exp ann -> [HS.Exp ann] -> CpsCont -> CPSM CpsExp
+rebuildApp head args k = go [] args
+  where
+    go seArgs []  = cpsValueM head "f" $ \se -> mkCpsApp se seArgs k
+    go acc (x:xs) = cpsValueM x "e" $ \se -> go (se:acc) xs
+
+-- | Construct an AppCps tree from an application head and some arguments.
+-- Monadic because we need to generate fresh names for the partial
+-- applications. If AppCps were changed to have a list of arguments, this
+-- could be pure.
+mkCpsApp :: SimpleExp -> [SimpleExp] -> CpsCont -> CPSM CpsExp
+mkCpsApp head args k = go head args
+  where
+    go head [] = error "mkCpsApp: no arguments"
+    go head [arg] = pure $ AppCps head arg k
+    go head (arg:rest) = do
+      p <- fresh "p"
+      AppCps head arg . FnCont p <$> go (Var p) rest
+
+-- Translate an HS.Pat to a CpsPat
+asCpsPat :: HS.Pat ann -> CpsPat
+asCpsPat (HS.PVar _ name) = VarPat $ flatName name
+asCpsPat (HS.PLit _ _ _)  = ConstPat
+asCpsPat HS.PNPlusK{} = unsupported "n+k pattern"
+asCpsPat (HS.PInfixApp _ l op r) = 
+  ConstrPat (flatName op) [asCpsPat l, asCpsPat r]
+asCpsPat (HS.PApp _ name pats) = 
+  ConstrPat (flatName name) $ map asCpsPat pats
+asCpsPat (HS.PTuple _ HS.Boxed (p:ps)) = 
+  TuplePat $ NE.map asCpsPat (p :| ps)
+asCpsPat (HS.PTuple _ HS.Unboxed _) = unsupported "unboxed tuple"
+asCpsPat (HS.PList _ pats) =
+  ConstrPat "[]" $ map asCpsPat pats
+asCpsPat (HS.PParen _ pat) = asCpsPat pat
+asCpsPat HS.PRec{} = unsupported "record pattern"
+asCpsPat (HS.PAsPat _ name pat) = AsPat (flatName name) (asCpsPat pat)
+asCpsPat (HS.PWildCard _) = ConstPat
+asCpsPat (HS.PIrrPat _ pat) = asCpsPat pat -- irrefutable patterns are an
+                                           -- evaluation order thing;
+                                           -- we really don't care here.
+asCpsPat (HS.PatTypeSig _ pat _) = asCpsPat pat -- type shouldn't be able
+                                                -- to refer to expression vars
+asCpsPat HS.PViewPat{} = unsupported "view pattern"
+asCpsPat HS.PRPat{}    = unsupported "HaRP pattern"
+asCpsPat HS.PXTag{}    = unsupported "XML pattern"
+asCpsPat HS.PXETag{}   = unsupported "XML pattern"
+asCpsPat HS.PXPcdata{} = unsupported "XML pattern"
+asCpsPat HS.PXPatTag{} = unsupported "XML pattern"
+asCpsPat HS.PXRPats{}  = unsupported "XML pattern"
+asCpsPat HS.PSplice{}  = unsupported "template haskell (pattern)"
+asCpsPat HS.PQuasiQuote{} = unsupported "template haskell (pattern)"
+asCpsPat (HS.PBangPat _ pat) = asCpsPat pat -- see PIrrPat
 
 -------------------------------------------------------------------------------
 -- Utilities for Language.Haskell.Exts
@@ -166,8 +252,7 @@ cpsExp (HS.Paren _ e) k = cpsExp e k
 class HasName a where
   flatName :: a -> Name
 
--- morally: instance HasName Name
-instance HasName [Char] where flatName = id
+instance HasName Name where flatName = id
 
 instance HasName (HS.Name ann) where
   flatName (HS.Ident _ name)  = name
@@ -199,7 +284,6 @@ instance Show SimpleExp where
   show (Var name) = name
 
 instance Show CpsPat where
-  showsPrec _ WildPat = showString "_"
   showsPrec _ ConstPat = showString "AConst"
   showsPrec _ (VarPat name) = showString name
   showsPrec _ (TuplePat pats) = showParen True $
@@ -237,7 +321,7 @@ instance Show CpsExp where
   -- applied and to use '$' for complex continuations.
   showsPrec _ (AppCps e1 e2 k) = showWithContinuation k $
     shows e1 . showChar ' ' . shows e2
-  showsPrec _ (FunCps pat kv e k) = showWithContinuation k $
+  showsPrec _ (LamCps pat kv e k) = showWithContinuation k $
     showParen True $ showChar '\\' . shows pat . showChar ' '
     . shows kv . showString " -> " . shows e
 
