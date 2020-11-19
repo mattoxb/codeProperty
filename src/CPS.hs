@@ -1,8 +1,9 @@
-{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE TupleSections #-}
 
 module CPS where
 
 import Errors
+import HSEExtra
 
 import           Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.List.NonEmpty as NE
@@ -14,10 +15,20 @@ import qualified Language.Haskell.Exts as HS
 type Name = String
 type Op   = Name
 
+-- | a fresh name generated during CPS or tail recursion
+-- detection. Differentiating between these and source Vars
+-- is not strictly necessary but allows us to worry less
+-- while detecting tail recursion :)
+data Unique = Unique Name !Int
+  deriving Eq
+
 -- | A Simple Expression in CPS.
 -- Variable names are preserved to detect alpha-capture later.
 -- If a value is a constant, we really don't care what it is.
-data SimpleExp = Const | Var Name
+data SimpleExp 
+  = Const 
+  | Var Name 
+  | Unq !Unique
   deriving Eq
 
 -- We don't care about the transform being exactly correct in terms
@@ -43,7 +54,7 @@ data ContVar = KVar Int -- distinguishing is convenient for debugging
 
 data CpsCont
   = VarCont ContVar
-  | FnCont Name CpsExp
+  | FnCont Unique CpsExp
   deriving Eq
 
 data CpsExp
@@ -51,7 +62,7 @@ data CpsExp
                                    -- expression to transform is simple
   | BinOpAppCps SimpleExp Op SimpleExp CpsCont
   | MatchCps SimpleExp [(CpsPat, CpsExp)]
-  | AppCps SimpleExp SimpleExp CpsCont
+  | AppCps SimpleExp [SimpleExp] CpsCont
   | LamCps CpsPat ContVar CpsExp CpsCont
   deriving Eq
 
@@ -71,9 +82,8 @@ next :: CPSM Int
 next = state $ \s -> (s, s+1)
 -- by using names that are illegal in Haskell as both operators and vars,
 -- we guarantee that there won't be clashes
-fresh :: Name -> CPSM Name
-fresh pre = do i <- next
-               return $ pre ++ "%" ++ show i
+fresh :: Name -> CPSM Unique
+fresh pre = Unique pre <$> next
 
 freshKVar :: CPSM ContVar
 freshKVar = KVar <$> next
@@ -94,8 +104,7 @@ isSimple _         = False
 -- are not. See 'SimpleExp'.
 asSimpleExp :: HS.Exp ann -> SimpleExp
 asSimpleExp (HS.Var _ name) = Var $ flatName name
--- this maybe isn't worth the special case idk
-asSimpleExp (HS.Con _ (HS.Special _ (HS.UnitCon _))) = Const
+-- We maybe don't need to keep these names around at all?
 asSimpleExp (HS.Con _ name) = Var $ flatName name
 asSimpleExp e | isSimple e = Const
               -- might as well play it safe since isSimple is cheap
@@ -119,7 +128,7 @@ cpsValueM :: HS.Exp ann -> String -> (SimpleExp -> CPSM CpsExp) -> CPSM CpsExp
 cpsValueM e pre consumer
   | isSimple e = consumer (asSimpleExp e)
   | otherwise  = do v <- fresh pre
-                    contBody <- consumer (Var v)
+                    contBody <- consumer (Unq v)
                     cpsExp e $ FnCont v contBody
 
 -- | 'cpsValueM', but in this simple case where the consumer is pure.
@@ -158,7 +167,7 @@ cpsExp app@(HS.App _ _ _) k = rebuildApp head args k
   where (head, args) = collectApp app
 
 cpsExp (HS.NegApp _ e) k = cpsValue e "v" $ \se -> 
-  AppCps (Var "Prelude.negate") se k
+  AppCps (Var "Prelude.negate") [se] k
 
 cpsExp (HS.Lambda _ pats body) k = do
   kvar <- freshKVar
@@ -178,7 +187,117 @@ cpsExp (HS.If _ b t f) k = do
                 , (ConstPat, cpsF)
                 ]
 
+cpsExp HS.MultiIf{} k = unsupported "multi-way if"
+
+cpsExp (HS.Case _ scrut alts) k = 
+  cpsValueM scrut "e" $ \se -> do
+    cpsAlts <- mapM (\alt -> cpsAlt alt k) alts
+    pure $ MatchCps se cpsAlts
+
+-- This one shouldn't be _too_ hard in theory if we want it
+cpsExp HS.Do{} k = unsupported "do notation"
+-- This one would be difficult.
+cpsExp HS.MDo{} k = unsupported "recursive do notation"
+cpsExp (HS.Tuple _ HS.Boxed exps) k = cpsMultiExp TupleMEC exps k
+cpsExp (HS.Tuple _ HS.Unboxed _)  k = unsupported "unboxed tuple"
+cpsExp HS.UnboxedSum{} k = unsupported "unboxed sum"
+cpsExp HS.TupleSection{} k = unsupported "tuple section"
+cpsExp (HS.List _ exps) k = cpsMultiExp ListMEC exps k
+cpsExp HS.ParArray{} k = unsupported "parallel array"
 cpsExp (HS.Paren _ e) k = cpsExp e k
+-- sections SHOULD be easy, so TODO. They also should be handled by collectApp,
+-- but honestly, who writes '(+1) 2' in real code?
+cpsExp HS.LeftSection{} k = unsupported "operator section"
+cpsExp HS.RightSection{} k = unsupported "operator section"
+cpsExp HS.RecConstr{} k = unsupported "record construction"
+cpsExp HS.RecUpdate{} k = unsupported "record update"
+-- The 'EnumX' family are semantics breaking in the same way as 'List'
+-- however we _could_ desugar them easily into
+-- Prelude.enumFrom, Prelude.EnumFromTo, etc.
+cpsExp (HS.EnumFrom _ e)              k = cpsMultiExp ListMEC [e] k
+cpsExp (HS.EnumFromTo _ e1 e2)        k = cpsMultiExp ListMEC [e1, e2] k
+cpsExp (HS.EnumFromThen _ e1 e2)      k = cpsMultiExp ListMEC [e1, e2] k
+cpsExp (HS.EnumFromThenTo _ e1 e2 e3) k = cpsMultiExp ListMEC [e1, e2, e3] k
+cpsExp HS.ParArrayFromTo{}     k = unsupported "parallel array"
+cpsExp HS.ParArrayFromThenTo{} k = unsupported "parallel array"
+-- What to do in this case is maybe not so clear. Is crashing OK? We DO expect
+-- to see these in the wild, but transforming them without desugraing them is
+-- basically impossible (because Stmts can be Generators, which bind names).
+-- On the other hand, in tail recursion questions, list comps are not allowed,
+-- so if the tree was scanned for list comprehensions already, it should be
+-- impossible to see one here at all.
+cpsExp HS.ListComp{}     k = unsupported "list comprehension during CPS"
+cpsExp HS.ParComp{}      k = unsupported "parallel list comprehension"
+cpsExp HS.ParArrayComp{} k = unsupported "parallel array comprehension"
+cpsExp (HS.ExpTypeSig _ e _) k = cpsExp e k
+cpsExp HS.VarQuote{}   k = unsupported "template haskell"
+cpsExp HS.TypQuote{}   k = unsupported "template haskell"
+cpsExp HS.BracketExp{} k = unsupported "template haskell"
+cpsExp HS.SpliceExp{}  k = unsupported "template haskell"
+cpsExp HS.QuasiQuote{} k = unsupported "template haskell"
+cpsExp HS.TypeApp{}    k = unsupported "type application"
+cpsExp HS.XTag{}       k = unsupported "XML expression"
+cpsExp HS.XETag{}      k = unsupported "XML expression"
+cpsExp HS.XPcdata{}    k = unsupported "XML expression"
+cpsExp HS.XExpTag{}    k = unsupported "XML expression"
+cpsExp HS.XChildTag{}  k = unsupported "XML expression"
+cpsExp HS.CorePragma{} k = unsupported "pragma during CPS"
+cpsExp HS.SCCPragma{}  k = unsupported "pragma during CPS"
+cpsExp HS.GenPragma{}  k = unsupported "pragma during CPS"
+cpsExp HS.Proc{}            k = unsupported "arrow syntax"
+cpsExp HS.LeftArrApp{}      k = unsupported "arrow syntax"
+cpsExp HS.RightArrApp{}     k = unsupported "arrow syntax"
+cpsExp HS.LeftArrHighApp{}  k = unsupported "arrow syntax"
+cpsExp HS.RightArrHighApp{} k = unsupported "arrow syntax"
+-- looks like we have an outdated haskell-src-exts that predates this
+-- cpsExp HS.ArrOp{}           k = unsupported "arrow syntax"
+cpsExp HS.LCase{} k = unsupported "lambda case"
+
+-- | CPS an alternative in a 'case' statement.
+cpsAlt :: HS.Alt ann -> CpsCont -> CPSM (CpsPat, CpsExp)
+-- we should be able to support this by just wrapping the cps'd RHS in
+-- a 'let binds in rhs'-style expression. Guards cause the RHS to turn
+-- into a case statement so putting let bindings before that should work.
+cpsAlt (HS.Alt _ _ _ (Just binds)) k = unsupported "'where' in case alternative"
+cpsAlt (HS.Alt _ pat rhs Nothing)  k = (asCpsPat pat,) <$> cpsRhs rhs k
+
+-- | CPS the RHS of a decl or 'case' alternative.
+-- BREAKS SEMANTICS: treats guards as a nested pattern match
+--   whereas a join point would be needed in practice. But we
+--   don't care about the behavior of fall-through here.
+cpsRhs :: HS.Rhs ann -> CpsCont -> CPSM CpsExp
+cpsRhs (HS.UnGuardedRhs _ e) k = cpsExp e k
+-- idea: evaluate all of the guards, then MatchCps AConst
+-- with one constant pattern for each of possible branches.
+cpsRhs (HS.GuardedRhss _ grhss) k = do
+    let (guardExps, rhsExps) = collectGrhss grhss
+    cpsRhsExps <- mapM (\e -> cpsExp e k) rhsExps
+    let cpsRhsClauses = map (ConstPat,) cpsRhsExps
+    unused <- fresh "_"
+    cpsMultiExp GuardMEC guardExps $ 
+      FnCont unused $ MatchCps Const cpsRhsClauses
+
+data MultiExpContext
+  = TupleMEC
+  | ListMEC
+  | GuardMEC
+
+instance Show MultiExpContext where
+  show TupleMEC = "()"
+  show ListMEC  = "[]"
+  show GuardMEC = "|"
+
+-- | CPS several expressions and effectively throw away the results
+-- but guarantee that they still appear by applying them to either
+-- '|', '[]', or '()' (none of which could be redefined by the code being
+-- transformed) depending on what we're doing.
+-- The application '() 1 2' is a proxy for '(1,2)'.
+cpsMultiExp :: MultiExpContext -> [HS.Exp ann] -> CpsCont -> CPSM CpsExp
+cpsMultiExp context es k = go [] es
+  where
+    go ses [] = do
+      return $ AppCps (Var (show context)) (reverse ses) k
+    go ses (e:es) = cpsValueM e "e" $ \se -> go (se:ses) es
 
 -- | Collect an application tree into an application head
 -- and a list of argument expressions. The arguments appear
@@ -189,27 +308,32 @@ collectApp exp = go exp
   where go (HS.App _ left arg) = let (f, args) = go left
                                  in (f, arg : args)
         go (HS.Paren _ e) = go e
+        
+        go (HS.InfixApp _ l op r) = (HS.Var ann name, [r, l])
+          where (ann, name) = case op of
+                  HS.QVarOp ann name -> (ann, name)
+                  HS.QConOp ann name -> (ann, name)
+
         go other = (other, [])
 
 -- | Reconstruct a collected HS.App into an AppCps tree.
 rebuildApp :: HS.Exp ann -> [HS.Exp ann] -> CpsCont -> CPSM CpsExp
 rebuildApp head args k = go [] args
   where
-    go seArgs []  = cpsValueM head "f" $ \se -> mkCpsApp se seArgs k
+    go seArgs []  = cpsValue head "f" $ \se -> AppCps se seArgs k
     go acc (x:xs) = cpsValueM x "e" $ \se -> go (se:acc) xs
 
--- | Construct an AppCps tree from an application head and some arguments.
--- Monadic because we need to generate fresh names for the partial
--- applications. If AppCps were changed to have a list of arguments, this
--- could be pure.
-mkCpsApp :: SimpleExp -> [SimpleExp] -> CpsCont -> CPSM CpsExp
-mkCpsApp head args k = go head args
-  where
-    go head [] = error "mkCpsApp: no arguments"
-    go head [arg] = pure $ AppCps head arg k
-    go head (arg:rest) = do
-      p <- fresh "p"
-      AppCps head arg . FnCont p <$> go (Var p) rest
+-- | Collect a list of GuardedRhss into a list of guard
+-- expressions and a list of RHS expressions.
+collectGrhss :: [HS.GuardedRhs ann] -> ([HS.Exp ann], [HS.Exp ann])
+collectGrhss [] = ([], [])
+collectGrhss (HS.GuardedRhs _ stmts e : rest)
+  | [HS.Qualifier _ g] <- stmts 
+  = let (gs, rs) = collectGrhss rest
+    in (g:gs, e:rs)
+
+  | otherwise
+  = unsupported "pattern guard"
 
 -- Translate an HS.Pat to a CpsPat
 asCpsPat :: HS.Pat ann -> CpsPat
@@ -229,9 +353,9 @@ asCpsPat (HS.PParen _ pat) = asCpsPat pat
 asCpsPat HS.PRec{} = unsupported "record pattern"
 asCpsPat (HS.PAsPat _ name pat) = AsPat (flatName name) (asCpsPat pat)
 asCpsPat (HS.PWildCard _) = ConstPat
-asCpsPat (HS.PIrrPat _ pat) = asCpsPat pat -- irrefutable patterns are an
-                                           -- evaluation order thing;
-                                           -- we really don't care here.
+asCpsPat (HS.PIrrPat _ pat) = asCpsPat pat -- irrefutable patterns are a
+                                           -- strictness thing; we really
+                                           -- don't care here.
 asCpsPat (HS.PatTypeSig _ pat _) = asCpsPat pat -- type shouldn't be able
                                                 -- to refer to expression vars
 asCpsPat HS.PViewPat{} = unsupported "view pattern"
@@ -246,32 +370,8 @@ asCpsPat HS.PQuasiQuote{} = unsupported "template haskell (pattern)"
 asCpsPat (HS.PBangPat _ pat) = asCpsPat pat -- see PIrrPat
 
 -------------------------------------------------------------------------------
--- Utilities for Language.Haskell.Exts
+-- Debugging
 -------------------------------------------------------------------------------
-
-class HasName a where
-  flatName :: a -> Name
-
-instance HasName Name where flatName = id
-
-instance HasName (HS.Name ann) where
-  flatName (HS.Ident _ name)  = name
-  flatName (HS.Symbol _ name) = name
-
-instance HasName (HS.QName ann) where
-  flatName (HS.Qual _ (HS.ModuleName _ m) n) = m ++ "." ++ flatName n
-  flatName (HS.UnQual _ n) = flatName n
-  flatName (HS.Special _ special) = case special of
-    HS.UnitCon _ -> "()"
-    HS.ListCon _ -> "[]"
-    HS.Cons _    -> ":"
-    HS.TupleCon _ HS.Boxed n -> "(" ++ replicate (n-1) ',' ++ ")"
-    other -> error $ "flatName@QName: can't handle " ++ 
-                     show (fmap (const ()) other)
-
-instance HasName (HS.QOp ann) where
-  flatName (HS.QVarOp _ name) = flatName name
-  flatName (HS.QConOp _ name) = flatName name
 
 -- Debugging; we don't need a whole pretty printer, just enough
 -- to be able to read what's going on.
@@ -282,6 +382,10 @@ showWithContinuation c@(FnCont _ _) a = a . showString " & " . shows c
 instance Show SimpleExp where
   show Const = "AConst"
   show (Var name) = name
+  show (Unq unique) = show unique
+
+instance Show Unique where
+  show (Unique n i) = n ++ "%" ++ show i
 
 instance Show CpsPat where
   showsPrec _ ConstPat = showString "AConst"
@@ -300,7 +404,7 @@ instance Show ContVar where
 
 instance Show CpsCont where
   showsPrec _ (VarCont cv) = shows cv
-  showsPrec _ (FnCont name exp) = showString "FN " . showString name
+  showsPrec _ (FnCont name exp) = showString "FN " . shows name
                                 . showString " -> " . shows exp
 
 intercalateS :: String -> [ShowS] -> ShowS
@@ -319,8 +423,8 @@ instance Show CpsExp where
   -- I'm doing it this way for consistency but it would be more syntactically 
   -- appropriate to pass simple continuations directly to the function being 
   -- applied and to use '$' for complex continuations.
-  showsPrec _ (AppCps e1 e2 k) = showWithContinuation k $
-    shows e1 . showChar ' ' . shows e2
+  showsPrec _ (AppCps head args k) = showWithContinuation k $
+    shows head . showChar ' ' . intercalateS " " (map shows args)
   showsPrec _ (LamCps pat kv e k) = showWithContinuation k $
     showParen True $ showChar '\\' . shows pat . showChar ' '
     . shows kv . showString " -> " . shows e
