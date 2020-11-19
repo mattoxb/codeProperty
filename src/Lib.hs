@@ -5,6 +5,8 @@
 -- not because we're relying on it. This extension should usually be avoided.
 module Lib where
 
+import Errors
+
 import Control.Monad
 import Data.IORef
 import Debug.Trace
@@ -175,7 +177,7 @@ recursiveCall names e = any (recursiveCall names) (ec e)
 checkRecursive x =
   case parseDecl x of
     ParseOk y -> isRecursive [] y
-    ParseFailed _ _ -> error genericUnsupportedMsg
+    ParseFailed _ _ -> panic
 
 ---- cps checker, tail/forward recursion checkers
 -- pretty sure these counters aren't used but a state monad is probably better post-refactoring
