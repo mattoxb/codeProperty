@@ -25,6 +25,9 @@ dependencies:
 - lens
 - mtl
 
+ghc-options:
+  - -fwarn-incomplete-patterns
+
 library:
   source-dirs: src
 
