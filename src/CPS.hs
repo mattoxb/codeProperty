@@ -1,4 +1,6 @@
-{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TupleSections      #-}
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# Language LambdaCase         #-}
 
 module CPS where
 
@@ -7,8 +9,11 @@ import HSEExtra
 
 import           Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.List.NonEmpty as NE
+import Data.Data (Data, Typeable)
 
 import Control.Monad.State.Strict
+import Control.Lens hiding (Const)
+import Data.Data.Lens (biplate)
 
 import qualified Language.Haskell.Exts as HS
 
@@ -19,17 +24,33 @@ type Op   = Name
 -- detection. Differentiating between these and source Vars
 -- is not strictly necessary but allows us to worry less
 -- while detecting tail recursion :)
-data Unique = Unique Name !Int
-  deriving Eq
+data Unique = Unique Provenance Name !Int
+  deriving (Eq, Typeable, Data)
+
+data Provenance
+  = CpsTransform
+  | Renaming
+  deriving (Eq, Typeable, Data)
+
+data Binder
+  = BindRaw Name -- ^ raw binding; perhaps a global or just
+                 -- has not yet been renamed
+  | BindUnq !Unique
+  deriving (Eq, Typeable, Data)
 
 -- | A Simple Expression in CPS.
 -- Variable names are preserved to detect alpha-capture later.
 -- If a value is a constant, we really don't care what it is.
 data SimpleExp 
   = Const 
-  | Var Name 
-  | Unq !Unique
-  deriving Eq
+  | Var Binder
+  deriving (Eq, Typeable, Data)
+
+mkRawVar :: Name -> SimpleExp
+mkRawVar = Var . BindRaw
+
+mkUnqVar :: Unique -> SimpleExp
+mkUnqVar = Var . BindUnq
 
 -- We don't care about the transform being exactly correct in terms
 -- of the shapes of patterns (esp. w.r.t to how functions are actually
@@ -40,37 +61,48 @@ data SimpleExp
 data CpsPat
   = ConstPat -- we don't really care about constant values
              -- wildcard pattern is a ConstPat too
-  | VarPat Name
-  | AsPat  Name CpsPat
+  | VarPat Binder
+  | AsPat  Binder CpsPat
   | TuplePat (NonEmpty CpsPat) -- in fact there are always >= 2
-  | ConstrPat String [CpsPat] -- constructor name is needed?
+  | ConstrPat Name [CpsPat] -- constructor name is needed?
     -- pattern "()" needs to be translated as ConstrPat "()" []
-  deriving Eq
+    -- Note that we use Name and not Binder because the constructor's
+    -- name is not being bound!
+  deriving (Eq, Typeable, Data)
 
 data ContVar = KVar Int -- distinguishing is convenient for debugging
                         -- but not actually necessary since there's
                         -- no non-local continuations in Haskell
-  deriving Eq
+  deriving (Eq, Typeable, Data)
 
 data CpsCont
   = VarCont ContVar
   | FnCont Unique CpsExp
-  deriving Eq
+  deriving (Eq, Typeable, Data)
 
 data CpsExp
   = SimpleExpCps SimpleExp CpsCont -- this should only happen when the entire
                                    -- expression to transform is simple
-  | BinOpAppCps SimpleExp Op SimpleExp CpsCont
-  | MatchCps SimpleExp [(CpsPat, CpsExp)]
+  | MatchCps SimpleExp [Clause]
   | AppCps SimpleExp [SimpleExp] CpsCont
   | LamCps CpsPat ContVar CpsExp CpsCont
-  deriving Eq
+  deriving (Eq, Typeable, Data)
+
+type Clause = (CpsPat, CpsExp)
+
+instance Plated CpsExp
 
 -------------------------------------------------------------------------------
 -- CPS Transform
 -------------------------------------------------------------------------------
 
+fresh :: Provenance -> Name -> State Int Unique
+fresh prov pre = Unique prov pre <$> next
+
 type CPSM = State Int
+
+freshCPS :: Name -> CPSM Unique
+freshCPS = fresh CpsTransform
 
 runCPSMFrom :: Int -> CPSM a -> a
 runCPSMFrom = flip evalState
@@ -80,10 +112,6 @@ runCPSM = runCPSMFrom 0
 
 next :: CPSM Int
 next = state $ \s -> (s, s+1)
--- by using names that are illegal in Haskell as both operators and vars,
--- we guarantee that there won't be clashes
-fresh :: Name -> CPSM Unique
-fresh pre = Unique pre <$> next
 
 freshKVar :: CPSM ContVar
 freshKVar = KVar <$> next
@@ -100,12 +128,12 @@ isSimple (HS.Con _ _) = True
 isSimple _         = False
 
 -- | Convert an HS.Exp that is simple to a 'SimpleExp'.
--- Variable names are preserved, but values of constants
+-- Variable names are preserved (as raw vars), but values of constants
 -- are not. See 'SimpleExp'.
 asSimpleExp :: HS.Exp ann -> SimpleExp
-asSimpleExp (HS.Var _ name) = Var $ flatName name
+asSimpleExp (HS.Var _ name) = mkRawVar $ flatName name
 -- We maybe don't need to keep these names around at all?
-asSimpleExp (HS.Con _ name) = Var $ flatName name
+asSimpleExp (HS.Con _ name) = mkRawVar $ flatName name
 asSimpleExp e | isSimple e = Const
               -- might as well play it safe since isSimple is cheap
               | otherwise  = error "asSimpleExp: non-simple argument"
@@ -127,8 +155,8 @@ asSimpleExp e | isSimple e = Const
 cpsValueM :: HS.Exp ann -> String -> (SimpleExp -> CPSM CpsExp) -> CPSM CpsExp
 cpsValueM e pre consumer
   | isSimple e = consumer (asSimpleExp e)
-  | otherwise  = do v <- fresh pre
-                    contBody <- consumer (Unq v)
+  | otherwise  = do v <- freshCPS pre
+                    contBody <- consumer (mkUnqVar v)
                     cpsExp e $ FnCont v contBody
 
 -- | 'cpsValueM', but in this simple case where the consumer is pure.
@@ -154,20 +182,21 @@ cases should not arise.
 cpsExp :: HS.Exp ann -> CpsCont -> CPSM CpsExp
 -- covers HS.Var, HS.Lit, HS.List [], '()', and HS.Con
 cpsExp e k | isSimple e = pure $ SimpleExpCps (asSimpleExp e) k
+
 cpsExp (HS.OverloadedLabel _ _) _ = unsupported "overloaded label syntax"
 cpsExp (HS.IPVar _ _) _ = unsupported "implicit parameters"
 
 cpsExp (HS.InfixApp _ e1 bigName e2) k = 
   cpsValueM e2 "v" $ \v2 -> -- right-to-left evaluation does e2 first
     cpsValueM e1 "v" $ \v1 -> 
-      return $ BinOpAppCps v1 name v2 k
+      return $ AppCps (Var (BindRaw name)) [v1,v2] k
   where name = flatName bigName
 
 cpsExp app@(HS.App _ _ _) k = rebuildApp head args k
   where (head, args) = collectApp app
 
 cpsExp (HS.NegApp _ e) k = cpsValue e "v" $ \se -> 
-  AppCps (Var "Prelude.negate") [se] k
+  AppCps (mkRawVar "Prelude.negate") [se] k
 
 cpsExp (HS.Lambda _ pats body) k = do
   kvar <- freshKVar
@@ -252,6 +281,10 @@ cpsExp HS.RightArrHighApp{} k = unsupported "arrow syntax"
 -- looks like we have an outdated haskell-src-exts that predates this
 -- cpsExp HS.ArrOp{}           k = unsupported "arrow syntax"
 cpsExp HS.LCase{} k = unsupported "lambda case"
+-- These last 3 are to shut up the pattern match exhaustiveness warning.
+cpsExp HS.Var{} k = error "cpsExp: isSimple missed a Var!"
+cpsExp HS.Con{} k = error "cpsExp: isSimple missed a Con!"
+cpsExp HS.Lit{} k = error "cpsExp: isSimple missed a Lit!"
 
 -- | CPS an alternative in a 'case' statement.
 cpsAlt :: HS.Alt ann -> CpsCont -> CPSM (CpsPat, CpsExp)
@@ -273,7 +306,7 @@ cpsRhs (HS.GuardedRhss _ grhss) k = do
     let (guardExps, rhsExps) = collectGrhss grhss
     cpsRhsExps <- mapM (\e -> cpsExp e k) rhsExps
     let cpsRhsClauses = map (ConstPat,) cpsRhsExps
-    unused <- fresh "_"
+    unused <- freshCPS "_"
     cpsMultiExp GuardMEC guardExps $ 
       FnCont unused $ MatchCps Const cpsRhsClauses
 
@@ -296,7 +329,7 @@ cpsMultiExp :: MultiExpContext -> [HS.Exp ann] -> CpsCont -> CPSM CpsExp
 cpsMultiExp context es k = go [] es
   where
     go ses [] = do
-      return $ AppCps (Var (show context)) (reverse ses) k
+      return $ AppCps (mkRawVar (show context)) (reverse ses) k
     go ses (e:es) = cpsValueM e "e" $ \se -> go (se:ses) es
 
 -- | Collect an application tree into an application head
@@ -337,21 +370,25 @@ collectGrhss (HS.GuardedRhs _ stmts e : rest)
 
 -- Translate an HS.Pat to a CpsPat
 asCpsPat :: HS.Pat ann -> CpsPat
-asCpsPat (HS.PVar _ name) = VarPat $ flatName name
+asCpsPat (HS.PVar _ name) = VarPat $ BindRaw $ flatName name
 asCpsPat (HS.PLit _ _ _)  = ConstPat
 asCpsPat HS.PNPlusK{} = unsupported "n+k pattern"
 asCpsPat (HS.PInfixApp _ l op r) = 
   ConstrPat (flatName op) [asCpsPat l, asCpsPat r]
 asCpsPat (HS.PApp _ name pats) = 
   ConstrPat (flatName name) $ map asCpsPat pats
+asCpsPat (HS.PTuple _ _ []) = -- this should be impossible
+  error "asCpsPat: empty tuple from haskell-src-exts"
 asCpsPat (HS.PTuple _ HS.Boxed (p:ps)) = 
   TuplePat $ NE.map asCpsPat (p :| ps)
 asCpsPat (HS.PTuple _ HS.Unboxed _) = unsupported "unboxed tuple"
+asCpsPat HS.PUnboxedSum{} = unsupported "unboxed sum" 
 asCpsPat (HS.PList _ pats) =
   ConstrPat "[]" $ map asCpsPat pats
 asCpsPat (HS.PParen _ pat) = asCpsPat pat
 asCpsPat HS.PRec{} = unsupported "record pattern"
-asCpsPat (HS.PAsPat _ name pat) = AsPat (flatName name) (asCpsPat pat)
+asCpsPat (HS.PAsPat _ name pat) = 
+  AsPat (BindRaw $ flatName name) (asCpsPat pat)
 asCpsPat (HS.PWildCard _) = ConstPat
 asCpsPat (HS.PIrrPat _ pat) = asCpsPat pat -- irrefutable patterns are a
                                            -- strictness thing; we really
@@ -369,6 +406,89 @@ asCpsPat HS.PSplice{}  = unsupported "template haskell (pattern)"
 asCpsPat HS.PQuasiQuote{} = unsupported "template haskell (pattern)"
 asCpsPat (HS.PBangPat _ pat) = asCpsPat pat -- see PIrrPat
 
+{------------------------------------------------------------------------------
+-- Renaming
+
+This section is for the renaming of subexpressions in a CpsExp tree. The idea
+is that _any_ name bound locally (i.e. not globally) gets replaced by a Unique
+at its binding site and everywhere it is used. 
+------------------------------------------------------------------------------}
+
+-- | "Renamer"
+-- (this is a common abbreviation in compilers)
+type Rn = State Int
+
+freshRn :: Name -> Rn Unique
+freshRn = fresh Renaming
+
+renameExp :: CpsExp -> CpsExp
+-- transformM works bottom-up, which correctly handles scoping naturally!
+renameExp = flip evalState 0 . transformM renameSubexp
+
+-- | Replace all instances of the given raw name in binders with
+-- the given unique.
+renameThingOnce :: Data thing
+                => Name    -- ^ The name to replace 
+                -> Unique  -- ^ The Unique to replace it with
+                -> thing   -- ^ Thing to rename in
+                -> thing   -- ^ Renamed thing
+renameThingOnce name unq = biplate %~ \case
+  BindRaw name' | name == name' -> BindUnq unq
+  otherBinder                   -> otherBinder
+
+-- | 'renameThingOnce' specialized to thing ~ CpsExp
+renameExpOnce :: Name -> Unique -> CpsExp -> CpsExp
+renameExpOnce = renameThingOnce
+
+-- | 'renameThingOnce' specialized to thing ~ Clause
+renameClauseOnce :: Name -> Unique -> Clause -> Clause
+renameClauseOnce = renameThingOnce
+
+-- | rename a CpsExp for several (Name, Unique) pairs rather than just one.
+renameExpMany :: [(Name, Unique)] -> CpsExp -> CpsExp
+renameExpMany pairs e = foldr (uncurry renameExpOnce) e pairs
+
+-- | 'renameExpMany', but for Clauses.
+renameClauseMany :: [(Name, Unique)] -> Clause -> Clause
+renameClauseMany pairs c = foldr (uncurry renameClauseOnce) c pairs
+
+-- | Rename a whole CPS Subexpression by inspecting the root node only.
+-- If the root node binds any names, fresh uniques are generated for them
+-- and the entire scope of each binding is renamed with its unique,
+-- including the binding site itself.
+renameSubexp :: CpsExp -> Rn CpsExp
+renameSubexp exp = case exp of
+    SimpleExpCps{} -> pure exp
+    MatchCps se clauses -> MatchCps se <$> mapM renameClause clauses
+    AppCps{}            -> pure exp
+    LamCps pat _ _ _    -> do
+      -- for each raw binder, pair it up with a fresh name
+      pairs <- renamesForPat pat
+      return $ renameExpMany pairs exp
+
+-- | 'renameSubExp' for clauses.
+renameClause :: Clause -> Rn Clause
+renameClause clause@(pat,_) = do
+  pairs <- renamesForPat pat
+  return $ renameClauseMany pairs clause
+
+-- | Another "exactly what it says on the tin" function.
+bindersInPat :: CpsPat -> [Binder]
+bindersInPat = toListOf biplate
+
+rawBindersInPat :: CpsPat -> [Name]
+rawBindersInPat = catRaws . bindersInPat
+  where
+    catRaws [] = []
+    catRaws (BindRaw name : rest) = name : catRaws rest
+    catRaws (BindUnq _    : rest) = catRaws rest
+
+renamesForPat :: CpsPat -> Rn [(Name, Unique)]
+renamesForPat = mapM (toSndM freshRn) . rawBindersInPat
+
+toSndM :: Functor m => (a -> m b) -> a -> m (a, b)
+toSndM f a = (a,) <$> f a
+
 -------------------------------------------------------------------------------
 -- Debugging
 -------------------------------------------------------------------------------
@@ -381,15 +501,24 @@ showWithContinuation c@(FnCont _ _) a = a . showString " & " . shows c
 
 instance Show SimpleExp where
   show Const = "AConst"
-  show (Var name) = name
-  show (Unq unique) = show unique
+  show (Var binder) = show binder
+
+instance Show Binder where
+  show (BindRaw name) = name
+  show (BindUnq unq)  = show unq
 
 instance Show Unique where
-  show (Unique n i) = n ++ "%" ++ show i
+  show (Unique p n i) = n ++ "%" ++ prov ++ show i
+    where prov = case p of
+            CpsTransform -> "cps"
+            Renaming     -> "rn"
 
 instance Show CpsPat where
   showsPrec _ ConstPat = showString "AConst"
-  showsPrec _ (VarPat name) = showString name
+  showsPrec _ (VarPat name) = shows name
+  showsPrec _ (AsPat bndr pat) = shows bndr
+                               . showChar '@' 
+                               . showParen True (shows pat)
   showsPrec _ (TuplePat pats) = showParen True $
     -- type is ShowS, so (.) ~ (++) and id ~ ""
     foldr (.) id $ NE.intersperse (showString ", ") $
@@ -415,8 +544,6 @@ intercalateS sep = go
 
 instance Show CpsExp where
   showsPrec _ (SimpleExpCps e k) = showWithContinuation k (shows e)
-  showsPrec _ (BinOpAppCps l op r k) =
-    showWithContinuation k $ intercalateS " " [shows l, showString op, shows r]
   showsPrec _ (MatchCps e clauses) = showString "case " . shows e 
     . showString " of { " . intercalateS "; " (map showClause clauses)
     . showString " }"
