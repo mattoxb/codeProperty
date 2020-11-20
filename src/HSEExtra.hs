@@ -33,6 +33,7 @@ instance HasName (HS.QName ann) where
     HS.ListCon _ -> "[]"
     HS.Cons _    -> ":"
     HS.TupleCon _ HS.Boxed n -> "(" ++ replicate (n-1) ',' ++ ")"
+    -- other things should only appear in types as far as I can tell.
     other -> error $ "flatName@QName: can't handle " ++ 
                      show (fmap (const ()) other)
 
