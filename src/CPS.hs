@@ -22,8 +22,8 @@ type Op   = Name
 
 -- | a fresh name generated during CPS or tail recursion
 -- detection. Differentiating between these and source Vars
--- is not strictly necessary but allows us to worry less
--- while detecting tail recursion :)
+-- is not strictly necessary but makes renaming much easier,
+-- allowing us to worry less while detecting tail recursion.
 data Unique = Unique Provenance Name !Int
   deriving (Eq, Typeable, Data)
 
@@ -33,8 +33,8 @@ data Provenance
   deriving (Eq, Typeable, Data)
 
 data Binder
-  = BindRaw Name -- ^ raw binding; perhaps a global or just
-                 -- has not yet been renamed
+  = BindRaw Name -- ^ raw binding; perhaps a free var (global)
+                 --  or just has not yet been renamed
   | BindUnq !Unique
   deriving (Eq, Typeable, Data)
 
@@ -81,8 +81,7 @@ data CpsCont
   deriving (Eq, Typeable, Data)
 
 data CpsExp
-  = SimpleExpCps SimpleExp CpsCont -- this should only happen when the entire
-                                   -- expression to transform is simple
+  = SimpleExpCps SimpleExp CpsCont
   | MatchCps SimpleExp [Clause]
   | AppCps SimpleExp [SimpleExp] CpsCont
   | LamCps CpsPat ContVar CpsExp CpsCont
@@ -91,6 +90,32 @@ data CpsExp
 type Clause = (CpsPat, CpsExp)
 
 instance Plated CpsExp
+
+{- | A Decl but in CPS. We use some hacks here to accomplish our goals:
+(1) All Haskell Decls get converted into a name binding a function in
+    the following way:
+      foo x 0 = bar x where ...1
+      foo x 1 = baz x where ...2
+    becomes
+      foo k = case Const of
+        { (x, Const) -> let ...1 in [[bar x]]_k
+        ; (x, Const) -> let ...2 in [[baz x]]_k 
+        }
+    Guards are handled the same way as for case expressions.
+(2) This includes simple pattern bindings (which may be eta-reduced function
+    bindings, otherwise we would just ignored them), so that
+      foo = go 0 where ...
+    becomes
+      foo k = let ... in [[go 0]]_k
+(3) non-simple pattern bindings, like (a, b) = (useX1, useX2) where X = ...
+    are not allowed.
+
+Note that the first 2 points are a major CPS semantics break; the function
+(if it even _is_ a function) will not take its continuation last and there is,
+of course, no guarantee in Haskell at all that functions will be fully applied
+when they are called. So don't try and use CpsDecls to evaluate code!
+-}
+data CpsDecl = Decl Name ContVar CpsExp
 
 -------------------------------------------------------------------------------
 -- CPS Transform
@@ -421,8 +446,11 @@ type Rn = State Int
 freshRn :: Name -> Rn Unique
 freshRn = fresh Renaming
 
+-- | Rename all bound variables in an entire CpsExp to disambiguate them.
+-- In the resulting CpsExp, the only raw binders are free variables of the
+-- input.
 renameExp :: CpsExp -> CpsExp
--- transformM works bottom-up, which correctly handles scoping naturally!
+-- transformM works bottom-up, which correctly handles shadowing naturally!
 renameExp = flip evalState 0 . transformM renameSubexp
 
 -- | Replace all instances of the given raw name in binders with
@@ -436,46 +464,39 @@ renameThingOnce name unq = biplate %~ \case
   BindRaw name' | name == name' -> BindUnq unq
   otherBinder                   -> otherBinder
 
--- | 'renameThingOnce' specialized to thing ~ CpsExp
-renameExpOnce :: Name -> Unique -> CpsExp -> CpsExp
-renameExpOnce = renameThingOnce
+-- | Replace all instances of each raw name in the input with the
+-- corresponding unique.
+renameThingMany :: Data thing => [(Name, Unique)] -> thing -> thing
+renameThingMany pairs thing = foldr (uncurry renameThingOnce) thing pairs
 
--- | 'renameThingOnce' specialized to thing ~ Clause
-renameClauseOnce :: Name -> Unique -> Clause -> Clause
-renameClauseOnce = renameThingOnce
-
--- | rename a CpsExp for several (Name, Unique) pairs rather than just one.
-renameExpMany :: [(Name, Unique)] -> CpsExp -> CpsExp
-renameExpMany pairs e = foldr (uncurry renameExpOnce) e pairs
-
--- | 'renameExpMany', but for Clauses.
-renameClauseMany :: [(Name, Unique)] -> Clause -> Clause
-renameClauseMany pairs c = foldr (uncurry renameClauseOnce) c pairs
-
--- | Rename a whole CPS Subexpression by inspecting the root node only.
+-- | Rename a CPS Subexpression by inspecting the root node only.
 -- If the root node binds any names, fresh uniques are generated for them
 -- and the entire scope of each binding is renamed with its unique,
 -- including the binding site itself.
 renameSubexp :: CpsExp -> Rn CpsExp
 renameSubexp exp = case exp of
     SimpleExpCps{} -> pure exp
-    MatchCps se clauses -> MatchCps se <$> mapM renameClause clauses
-    AppCps{}            -> pure exp
-    LamCps pat _ _ _    -> do
-      -- for each raw binder, pair it up with a fresh name
+    MatchCps se clauses  -> MatchCps se <$> mapM renameClause clauses
+    AppCps{}             -> pure exp
+    LamCps pat var body k -> do
       pairs <- renamesForPat pat
-      return $ renameExpMany pairs exp
+      let rpat  = renameThingMany pairs pat  -- thing ~ CpsPat
+          rbody = renameThingMany pairs body -- thing ~ CpsExp
+      -- don't rename the continuation, because the binders don't
+      -- scope over it!
+      return $ LamCps rpat var rbody k
 
 -- | 'renameSubExp' for clauses.
 renameClause :: Clause -> Rn Clause
 renameClause clause@(pat,_) = do
   pairs <- renamesForPat pat
-  return $ renameClauseMany pairs clause
+  return $ renameThingMany pairs clause -- thing ~ Clause
 
 -- | Another "exactly what it says on the tin" function.
 bindersInPat :: CpsPat -> [Binder]
 bindersInPat = toListOf biplate
 
+-- | 'bindersInPat', but only the raw binders.
 rawBindersInPat :: CpsPat -> [Name]
 rawBindersInPat = catRaws . bindersInPat
   where
@@ -483,6 +504,7 @@ rawBindersInPat = catRaws . bindersInPat
     catRaws (BindRaw name : rest) = name : catRaws rest
     catRaws (BindUnq _    : rest) = catRaws rest
 
+-- | For each raw binder in the pattern, generate a fresh unique.
 renamesForPat :: CpsPat -> Rn [(Name, Unique)]
 renamesForPat = mapM (toSndM freshRn) . rawBindersInPat
 
