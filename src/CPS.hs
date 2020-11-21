@@ -92,7 +92,7 @@ type Clause = (CpsPat, CpsExp)
 instance Plated CpsExp
 
 {- | A Decl but in CPS. We use some hacks here to accomplish our goals:
-(1) All Haskell Decls get converted into a name binding a function in
+(1) All Haskell Decls get converted into a name binding an expression in
     the following way:
       foo x 0 = bar x where ...1
       foo x 1 = baz x where ...2
@@ -110,10 +110,9 @@ instance Plated CpsExp
 (3) non-simple pattern bindings, like (a, b) = (useX1, useX2) where X = ...
     are not allowed.
 
-Note that the first 2 points are a major CPS semantics break; the function
-(if it even _is_ a function) will not take its continuation last and there is,
-of course, no guarantee in Haskell at all that functions will be fully applied
-when they are called. So don't try and use CpsDecls to evaluate code!
+Note that the first 2 points are a major CPS semantics break; the result is
+not actually a function! However it is sufficient for our needs, which are
+to make the order of evaluation in the body explicit.
 -}
 data CpsDecl = Decl Name ContVar CpsExp
 
