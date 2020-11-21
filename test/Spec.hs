@@ -4,9 +4,15 @@ import Test.Tasty.HUnit
 import Control.Monad (mapM_)
 import qualified Language.Haskell.Exts.Syntax as Syntax (Decl)
 import qualified Language.Haskell.Exts.SrcLoc as Ann    (SrcSpanInfo)
-import qualified Language.Haskell.Exts.Parser as Parse  (ParseResult(..), parseDecl)
+import qualified Language.Haskell.Exts.Parser as Parse
 
-import Lib
+import Lib hiding (cpsExp)
+import CPS
+import TailRecursion
+
+-- I'd like to write a property test like
+-- prop_renameLeavesFvs exp = sort (alLRawBinders (renameExp exp)) == freeVars exp
+-- but I really don't know how to make a good Arbitrary instance for CpsExp.
 
 main :: IO ()
 main = defaultMain hunitTests
@@ -14,6 +20,7 @@ main = defaultMain hunitTests
 hunitTests = testGroup "HUnit tests"
   [ checkRecursiveTests
   , checkTailTests
+  , onlyTailCallsTests
   ]
 
 checkRecursiveTests = testGroup "checkRecursive tests"
@@ -127,3 +134,43 @@ decListRecursive = testCase "decList" $
       unlines [ "decList = go []"
               , "  where go acc [] = reverse acc"
               , "        go acc (x:xs) = go (x-1 : acc) xs" ]
+
+-------------------------------------------------------------------------------
+-- TailRecursion.hs
+-------------------------------------------------------------------------------
+
+type Source = String
+
+processExp :: Source -> CpsExp
+processExp src = case Parse.parseExp src of
+  Parse.ParseOk exp ->
+    let cpsE = runCPSM $ do kvar <- freshKVar
+                            cpsExp exp (VarCont kvar)
+        cpsRN = renameExp cpsE
+    in cpsRN
+  Parse.ParseFailed{} -> error "processExp: couldn't parse exp source"
+
+onlyTailCallsTests :: TestTree
+onlyTailCallsTests = testGroup "onlyTailCalls" $ map check
+  [ ("simple example", ["rev"], "rev (x:acc) xs", True)
+  , ("tail call inside lambda", ["rev"], "(\\() -> rev) (x:acc) xs", False)
+  , ("reverse", ["rev"], revBody, True)
+  , ("vacuous 1", [], "(foo x, bar y, [1, 2, z])", True)
+  , ("vacuous 2", ["doesNotAppear"], "tail (x+y)", True)
+  , ("non-tail", ["acc"], revBody, False)
+  , ("one good and one bad 1", ["acc", "rev"], revBody, False)
+  , ("one good and one bad 2", ["rev", "acc"], revBody, False)
+  , ("dead simple", ["s"], "s", True)
+  , ("dead simple application", ["s"], "s 0", True)
+  , ("dead simple argument", ["s"], "() s", False)
+  , ("omega", ["omega"], "omega omega", False)
+  , ("dead simple paren", ["s"], "(s)", True)
+  , ("dead simple tuple", ["s"], "(s, 0)", False)
+  ]
+  
+  where revBody = "case lst of [] -> acc; (x:xs) -> rev (x:acc) xs"
+
+        check :: (String, [Name], Source, Bool) -> TestTree
+        check (desc, names, src, expected) = testCase desc $ assertBool 
+          ("expected " ++ show expected ++ " but got " ++ show (not expected))
+          (expected == onlyTailCalls (processExp src) names)
