@@ -20,6 +20,7 @@ main = defaultMain hunitTests
 hunitTests = testGroup "HUnit tests"
   [ checkRecursiveTests
   , checkTailTests
+  , refersToTests
   , onlyTailCallsTests
   ]
 
@@ -140,6 +141,7 @@ decListRecursive = testCase "decList" $
 -------------------------------------------------------------------------------
 
 type Source = String
+type Desc   = String
 
 processExp :: Source -> CpsExp
 processExp src = case Parse.parseExp src of
@@ -149,6 +151,12 @@ processExp src = case Parse.parseExp src of
         cpsRN = renameExp cpsE
     in cpsRN
   Parse.ParseFailed{} -> error "processExp: couldn't parse exp source"
+
+testFromSource :: (Eq result, Show result)
+               => (CpsExp -> [Binder] -> result)
+               -> (Desc, [Name], Source, result) -> TestTree
+testFromSource f (desc, arg, src, expected) = testCase desc $
+  expected @=? f (processExp src) (map BindRaw arg)
 
 onlyTailCallsTests :: TestTree
 onlyTailCallsTests = testGroup "onlyTailCalls" $ map check
@@ -167,10 +175,26 @@ onlyTailCallsTests = testGroup "onlyTailCalls" $ map check
   , ("dead simple paren", ["s"], "(s)", True)
   , ("dead simple tuple", ["s"], "(s, 0)", False)
   ]
-  
+
   where revBody = "case lst of [] -> acc; (x:xs) -> rev (x:acc) xs"
 
-        check :: (String, [Name], Source, Bool) -> TestTree
-        check (desc, names, src, expected) = testCase desc $ assertBool 
-          ("expected " ++ show expected ++ " but got " ++ show (not expected))
-          (expected == onlyTailCalls (processExp src) names)
+        check = testFromSource onlyTailCalls
+
+refersToTests :: TestTree
+refersToTests = testGroup "refersTo" $ map check
+  [ ("simple contains", ["x"], "x", True)
+  , ("simple does not contain", ["x"], "y", False)
+  , ("contains superstring", ["x"], "xy", False)
+  , ("contains in app", ["x"], "foo x", True)
+  , ("contains in case scrut", ["bar"], "case bar of () -> ()", True)
+  , ("contains in case branch", ["baz"], "case () of () -> baz", True)
+  , ("contains in lambda body", ["x"], "\\() -> x", True)
+  , ( "does not contain shadowed (case)", ["foo"]
+    , "case () of foo -> foo", False)
+  , ( "does not contain shadowed (lambda)", ["omega"]
+    , "\\omega -> omega omega", False)
+  , ("contains several", ["x", "y"], "case () of () -> x; () -> y", True)
+  , ("contains some but not all", ["foo", "bar"], "(0, foo)", True)
+  , ("contains none", ["foo", "bar", "baz"], "x ()", False)
+  ]
+  where check = testFromSource refersTo

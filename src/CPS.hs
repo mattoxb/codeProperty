@@ -41,8 +41,8 @@ data Binder
 -- | A Simple Expression in CPS.
 -- Variable names are preserved to detect alpha-capture later.
 -- If a value is a constant, we really don't care what it is.
-data SimpleExp 
-  = Const 
+data SimpleExp
+  = Const
   | Var Binder
   deriving (Eq, Typeable, Data)
 
@@ -56,7 +56,7 @@ mkUnqVar = Var . BindUnq
 -- of the shapes of patterns (esp. w.r.t to how functions are actually
 -- applied) because we're never going to run the code. But we _do_ need
 -- to know the names of the binders in lambdas. Thus it's OK to, for
--- example, translate [1, 2, x] as 
+-- example, translate [1, 2, x] as
 -- ConstrPat "[]" [ConstPat, ConstPat, VarPat "x"].
 data CpsPat
   = ConstPat -- we don't really care about constant values
@@ -70,7 +70,7 @@ data CpsPat
     -- name is not being bound!
   deriving (Eq, Typeable, Data)
 
-data ContVar = KVar Int -- distinguishing is convenient for debugging
+newtype ContVar = KVar Int -- distinguishing is convenient for debugging
                         -- but not actually necessary since there's
                         -- no non-local continuations in Haskell
   deriving (Eq, Typeable, Data)
@@ -85,6 +85,8 @@ data CpsExp
   | MatchCps SimpleExp [Clause]
   | AppCps SimpleExp [SimpleExp] CpsCont
   | LamCps CpsPat ContVar CpsExp CpsCont
+  -- todo
+  -- | LetCps [CpsDecl] CpsExp
   deriving (Eq, Typeable, Data)
 
 type Clause = (CpsPat, CpsExp)
@@ -99,7 +101,7 @@ instance Plated CpsExp
     becomes
       foo k = case Const of
         { (x, Const) -> let ...1 in [[bar x]]_k
-        ; (x, Const) -> let ...2 in [[baz x]]_k 
+        ; (x, Const) -> let ...2 in [[baz x]]_k
         }
     Guards are handled the same way as for case expressions.
 (2) This includes simple pattern bindings (which may be eta-reduced function
@@ -114,7 +116,7 @@ Note that the first 2 points are a major CPS semantics break; the result is
 not actually a function! However it is sufficient for our needs, which are
 to make the order of evaluation in the body explicit.
 -}
-data CpsDecl = Decl Name ContVar CpsExp
+data CpsBinding = Binding Name ContVar CpsExp
 
 -------------------------------------------------------------------------------
 -- CPS Transform
@@ -163,7 +165,7 @@ asSimpleExp e | isSimple e = Const
               | otherwise  = error "asSimpleExp: non-simple argument"
 
 -- | Converts any expression into a simple expression.
--- If the expression is simple as given, it is converted and handed 
+-- If the expression is simple as given, it is converted and handed
 -- to the callback. Otherwise, the CPS transform of the expression is
 -- taken and a continuation is constructed which hands the resulting
 -- simple expression (the value thrown to the continuation) to the callback.
@@ -210,16 +212,16 @@ cpsExp e k | isSimple e = pure $ SimpleExpCps (asSimpleExp e) k
 cpsExp (HS.OverloadedLabel _ _) _ = unsupported "overloaded label syntax"
 cpsExp (HS.IPVar _ _) _ = unsupported "implicit parameters"
 
-cpsExp (HS.InfixApp _ e1 bigName e2) k = 
+cpsExp (HS.InfixApp _ e1 bigName e2) k =
   cpsValueM e2 "v" $ \v2 -> -- right-to-left evaluation does e2 first
-    cpsValueM e1 "v" $ \v1 -> 
+    cpsValueM e1 "v" $ \v1 ->
       return $ AppCps (Var (BindRaw name)) [v1,v2] k
   where name = flatName bigName
 
-cpsExp app@(HS.App _ _ _) k = rebuildApp head args k
+cpsExp app@HS.App{} k = rebuildApp head args k
   where (head, args) = collectApp app
 
-cpsExp (HS.NegApp _ e) k = cpsValue e "v" $ \se -> 
+cpsExp (HS.NegApp _ e) k = cpsValue e "v" $ \se ->
   AppCps (mkRawVar "Prelude.negate") [se] k
 
 cpsExp (HS.Lambda _ pats body) k = do
@@ -242,7 +244,7 @@ cpsExp (HS.If _ b t f) k = do
 
 cpsExp HS.MultiIf{} k = unsupported "multi-way if"
 
-cpsExp (HS.Case _ scrut alts) k = 
+cpsExp (HS.Case _ scrut alts) k =
   cpsValueM scrut "e" $ \se -> do
     cpsAlts <- mapM (\alt -> cpsAlt alt k) alts
     pure $ MatchCps se cpsAlts
@@ -259,7 +261,7 @@ cpsExp (HS.List _ exps) k = cpsMultiExp ListMEC exps k
 cpsExp HS.ParArray{} k = unsupported "parallel array"
 cpsExp (HS.Paren _ e) k = cpsExp e k
 -- sections SHOULD be easy, so TODO. They also should be handled by collectApp,
--- but honestly, who writes '(+1) 2' in real code?
+-- but honestly, who writes '(1+) 2' in real code?
 cpsExp HS.LeftSection{} k = unsupported "operator section"
 cpsExp HS.RightSection{} k = unsupported "operator section"
 cpsExp HS.RecConstr{} k = unsupported "record construction"
@@ -331,7 +333,7 @@ cpsRhs (HS.GuardedRhss _ grhss) k = do
     cpsRhsExps <- mapM (\e -> cpsExp e k) rhsExps
     let cpsRhsClauses = map (ConstPat,) cpsRhsExps
     unused <- freshCPS "_"
-    cpsMultiExp GuardMEC guardExps $ 
+    cpsMultiExp GuardMEC guardExps $
       FnCont unused $ MatchCps Const cpsRhsClauses
 
 data MultiExpContext
@@ -352,7 +354,7 @@ instance Show MultiExpContext where
 cpsMultiExp :: MultiExpContext -> [HS.Exp ann] -> CpsCont -> CPSM CpsExp
 cpsMultiExp context es k = go [] es
   where
-    go ses [] = do
+    go ses [] =
       return $ AppCps (mkRawVar (show context)) (reverse ses) k
     go ses (e:es) = cpsValueM e "e" $ \se -> go (se:ses) es
 
@@ -361,11 +363,11 @@ cpsMultiExp context es k = go [] es
 -- from RIGHT TO LEFT. This is natural for a right-to-left
 -- evaluation order.
 collectApp :: HS.Exp ann -> (HS.Exp ann, [HS.Exp ann])
-collectApp exp = go exp
+collectApp = go
   where go (HS.App _ left arg) = let (f, args) = go left
                                  in (f, arg : args)
         go (HS.Paren _ e) = go e
-        
+
         go (HS.InfixApp _ l op r) = (HS.Var ann name, [r, l])
           where (ann, name) = case op of
                   HS.QVarOp ann name -> (ann, name)
@@ -385,33 +387,67 @@ rebuildApp head args k = go [] args
 collectGrhss :: [HS.GuardedRhs ann] -> ([HS.Exp ann], [HS.Exp ann])
 collectGrhss [] = ([], [])
 collectGrhss (HS.GuardedRhs _ stmts e : rest)
-  | [HS.Qualifier _ g] <- stmts 
+  | [HS.Qualifier _ g] <- stmts
   = let (gs, rs) = collectGrhss rest
     in (g:gs, e:rs)
 
   | otherwise
   = unsupported "pattern guard"
 
+-- | CPS a Haskell binding, top-level or otherwise.
+-- See the note on 'CpsBinding'.
+cpsBinding :: HS.Decl ann -> CPSM (Maybe CpsBinding)
+cpsBinding (HS.FunBind ann ms@(HS.Match _ hsname _ _ _ : _)) = do
+  let name = flatName hsname
+      alts = map matchAsAlt ms
+      explode = error "cpsBinding: annotation in synthetic case was forced"
+      anyConstant = HS.Int explode 0 "0"
+      caseExp = HS.Case ann (HS.Lit explode anyConstant) alts
+  kvar <- freshKVar
+  body <- cpsExp caseExp (VarCont kvar)
+  return $ Just $ Binding name kvar body
+cpsBinding (HS.PatBind _ pat rhs mbinds)
+  | Just _binds <- mbinds = unsupported "local definitions (coming soontm)"
+  | HS.PVar _ name <- pat = do cont <- freshKVar
+                               exp  <- cpsRhs rhs $ VarCont cont
+                               return $ Just $ Binding (flatName name) cont exp
+  | otherwise = unsupported "pattern binding"
+
+cpsBinding HS.FunBind{} = error "cpsBinding: function decl with no clauses"
+cpsBinding _ = pure Nothing
+
+-- | Convert a Match to an Alt
+-- More or less just throws away the normal/infix distinction
+matchAsAlt :: HS.Match ann -> HS.Alt ann
+matchAsAlt match = HS.Alt ann pat rhs mbinds
+  where HS.Match ann _ pats rhs mbinds = unInfix match
+
+        unInfix m@HS.Match{} = m
+        unInfix (HS.InfixMatch ann lpat n rpats rhs mbinds) =
+          HS.Match ann n (lpat:rpats) rhs mbinds
+
+        pat = HS.PTuple undefined HS.Boxed pats
+
 -- Translate an HS.Pat to a CpsPat
 asCpsPat :: HS.Pat ann -> CpsPat
 asCpsPat (HS.PVar _ name) = VarPat $ BindRaw $ flatName name
-asCpsPat (HS.PLit _ _ _)  = ConstPat
+asCpsPat HS.PLit{} = ConstPat
 asCpsPat HS.PNPlusK{} = unsupported "n+k pattern"
-asCpsPat (HS.PInfixApp _ l op r) = 
+asCpsPat (HS.PInfixApp _ l op r) =
   ConstrPat (flatName op) [asCpsPat l, asCpsPat r]
-asCpsPat (HS.PApp _ name pats) = 
+asCpsPat (HS.PApp _ name pats) =
   ConstrPat (flatName name) $ map asCpsPat pats
 asCpsPat (HS.PTuple _ _ []) = -- this should be impossible
   error "asCpsPat: empty tuple from haskell-src-exts"
-asCpsPat (HS.PTuple _ HS.Boxed (p:ps)) = 
+asCpsPat (HS.PTuple _ HS.Boxed (p:ps)) =
   TuplePat $ NE.map asCpsPat (p :| ps)
 asCpsPat (HS.PTuple _ HS.Unboxed _) = unsupported "unboxed tuple"
-asCpsPat HS.PUnboxedSum{} = unsupported "unboxed sum" 
+asCpsPat HS.PUnboxedSum{} = unsupported "unboxed sum"
 asCpsPat (HS.PList _ pats) =
   ConstrPat "[]" $ map asCpsPat pats
 asCpsPat (HS.PParen _ pat) = asCpsPat pat
 asCpsPat HS.PRec{} = unsupported "record pattern"
-asCpsPat (HS.PAsPat _ name pat) = 
+asCpsPat (HS.PAsPat _ name pat) =
   AsPat (BindRaw $ flatName name) (asCpsPat pat)
 asCpsPat (HS.PWildCard _) = ConstPat
 asCpsPat (HS.PIrrPat _ pat) = asCpsPat pat -- irrefutable patterns are a
@@ -435,7 +471,7 @@ asCpsPat (HS.PBangPat _ pat) = asCpsPat pat -- see PIrrPat
 
 This section is for the renaming of subexpressions in a CpsExp tree. The idea
 is that _any_ name bound locally (i.e. not globally) gets replaced by a Unique
-at its binding site and everywhere it is used. 
+at its binding site and everywhere it is used.
 ------------------------------------------------------------------------------}
 
 -- | "Renamer"
@@ -455,7 +491,7 @@ renameExp = flip evalState 0 . transformM renameSubexp
 -- | Replace all instances of the given raw name in binders with
 -- the given unique.
 renameThingOnce :: Data thing
-                => Name    -- ^ The name to replace 
+                => Name    -- ^ The name to replace
                 -> Unique  -- ^ The Unique to replace it with
                 -> thing   -- ^ Thing to rename in
                 -> thing   -- ^ Renamed thing
@@ -538,7 +574,7 @@ instance Show CpsPat where
   showsPrec _ ConstPat = showString "AConst"
   showsPrec _ (VarPat name) = shows name
   showsPrec _ (AsPat bndr pat) = shows bndr
-                               . showChar '@' 
+                               . showChar '@'
                                . showParen True (shows pat)
   showsPrec _ (TuplePat pats) = showParen True $
     -- type is ShowS, so (.) ~ (++) and id ~ ""
@@ -565,17 +601,22 @@ intercalateS sep = go
 
 instance Show CpsExp where
   showsPrec _ (SimpleExpCps e k) = showWithContinuation k (shows e)
-  showsPrec _ (MatchCps e clauses) = showString "case " . shows e 
+  showsPrec _ (MatchCps e clauses) = showString "case " . shows e
     . showString " of { " . intercalateS "; " (map showClause clauses)
     . showString " }"
-  -- I'm doing it this way for consistency but it would be more syntactically 
-  -- appropriate to pass simple continuations directly to the function being 
+  -- I'm doing it this way for consistency but it would be more syntactically
+  -- appropriate to pass simple continuations directly to the function being
   -- applied and to use '$' for complex continuations.
   showsPrec _ (AppCps head args k) = showWithContinuation k $
     shows head . showChar ' ' . intercalateS " " (map shows args)
   showsPrec _ (LamCps pat kv e k) = showWithContinuation k $
     showParen True $ showChar '\\' . shows pat . showChar ' '
     . shows kv . showString " -> " . shows e
+
+instance Show CpsBinding where
+  showsPrec _ (Binding name kvar exp) =
+    showString name . showChar ' ' . shows kvar
+    . showString " = " . shows exp
 
 showClause :: (CpsPat, CpsExp) -> ShowS
 showClause (p, e) = shows p . showString " -> " . shows e
