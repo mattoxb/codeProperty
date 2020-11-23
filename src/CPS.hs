@@ -10,6 +10,7 @@ import HSEExtra
 import           Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.List.NonEmpty as NE
 import Data.Data (Data, Typeable)
+import Data.Maybe (catMaybes)
 
 import Control.Monad.State.Strict
 import Control.Lens hiding (Const)
@@ -85,13 +86,12 @@ data CpsExp
   | MatchCps SimpleExp [Clause]
   | AppCps SimpleExp [SimpleExp] CpsCont
   | LamCps CpsPat ContVar CpsExp CpsCont
-  -- todo
-  -- | LetCps [CpsDecl] CpsExp
+  | LetCps [CpsBinding] CpsExp
   deriving (Eq, Typeable, Data)
 
-type Clause = (CpsPat, CpsExp)
-
 instance Plated CpsExp
+
+type Clause = (CpsPat, CpsExp)
 
 {- | A Decl but in CPS. We use some hacks here to accomplish our goals:
 (1) All Haskell Decls get converted into a name binding an expression in
@@ -116,7 +116,8 @@ Note that the first 2 points are a major CPS semantics break; the result is
 not actually a function! However it is sufficient for our needs, which are
 to make the order of evaluation in the body explicit.
 -}
-data CpsBinding = Binding Name ContVar CpsExp
+data CpsBinding = Binding Binder ContVar CpsExp
+  deriving (Eq, Typeable, Data)
 
 -------------------------------------------------------------------------------
 -- CPS Transform
@@ -232,7 +233,11 @@ cpsExp (HS.Lambda _ pats body) k = do
   cpsBody <- cpsExp body $ VarCont kvar
   return $ LamCps cpsPat kvar cpsBody k
 
-cpsExp HS.Let{} k = unsupported "let expression (support coming soon! ^hopefullytm)"
+cpsExp (HS.Let _ (HS.BDecls _ decls) body) k = do
+  cpsBinds <- cpsBindings decls
+  cpsBody  <- cpsExp body k
+  return $ LetCps cpsBinds cpsBody
+cpsExp (HS.Let _ HS.IPBinds{} _) k = unsupported "implicit parameter binding"
 
 cpsExp (HS.If _ b t f) k = do
   cpsT <- cpsExp t k
@@ -317,7 +322,8 @@ cpsAlt :: HS.Alt ann -> CpsCont -> CPSM (CpsPat, CpsExp)
 -- we should be able to support this by just wrapping the cps'd RHS in
 -- a 'let binds in rhs'-style expression. Guards cause the RHS to turn
 -- into a case statement so putting let bindings before that should work.
-cpsAlt (HS.Alt _ _ _ (Just binds)) k = unsupported "'where' in case alternative"
+cpsAlt (HS.Alt _ pat rhs (Just binds)) k =
+  (asCpsPat pat,) <$> cpsRhsWithLocals (Just binds) rhs k
 cpsAlt (HS.Alt _ pat rhs Nothing)  k = (asCpsPat pat,) <$> cpsRhs rhs k
 
 -- | CPS the RHS of a decl or 'case' alternative.
@@ -335,6 +341,19 @@ cpsRhs (HS.GuardedRhss _ grhss) k = do
     unused <- freshCPS "_"
     cpsMultiExp GuardMEC guardExps $
       FnCont unused $ MatchCps Const cpsRhsClauses
+
+cpsRhsWithLocals :: Maybe (HS.Binds ann)
+                 -> HS.Rhs ann 
+                 -> CpsCont 
+                 -> CPSM CpsExp
+cpsRhsWithLocals Nothing rhs k = cpsRhs rhs k
+cpsRhsWithLocals (Just (HS.BDecls _ decls)) rhs k = do
+  binds <- cpsBindings decls
+  case binds of
+    [] -> cpsRhs rhs k -- I'm not actually convinced this is possible
+    bs -> LetCps bs <$> cpsRhs rhs k
+cpsRhsWithLocals (Just HS.IPBinds{}) rhs k = 
+  unsupported "implicit parameter binding"
 
 data MultiExpContext
   = TupleMEC
@@ -380,7 +399,7 @@ rebuildApp :: HS.Exp ann -> [HS.Exp ann] -> CpsCont -> CPSM CpsExp
 rebuildApp head args k = go [] args
   where
     go seArgs []  = cpsValue head "f" $ \se -> AppCps se seArgs k
-    go acc (x:xs) = cpsValueM x "e" $ \se -> go (se:acc) xs
+    go acc (x:xs) = cpsValueM x "a" $ \se -> go (se:acc) xs
 
 -- | Collect a list of GuardedRhss into a list of guard
 -- expressions and a list of RHS expressions.
@@ -405,16 +424,24 @@ cpsBinding (HS.FunBind ann ms@(HS.Match _ hsname _ _ _ : _)) = do
       caseExp = HS.Case ann (HS.Lit explode anyConstant) alts
   kvar <- freshKVar
   body <- cpsExp caseExp (VarCont kvar)
-  return $ Just $ Binding name kvar body
-cpsBinding (HS.PatBind _ pat rhs mbinds)
-  | Just _binds <- mbinds = unsupported "local definitions (coming soontm)"
-  | HS.PVar _ name <- pat = do cont <- freshKVar
-                               exp  <- cpsRhs rhs $ VarCont cont
-                               return $ Just $ Binding (flatName name) cont exp
-  | otherwise = unsupported "pattern binding"
+  return $ Just $ Binding (BindRaw name) kvar body
+cpsBinding (HS.PatBind _ (HS.PVar _ name) rhs mbinds) = 
+  do cont <- freshKVar
+     exp  <- cpsRhsWithLocals mbinds rhs $ VarCont cont
+     return $
+       Just $
+       Binding (BindRaw $ flatName name) cont exp
 
+-- matches if the pat is not a PVar
+cpsBinding HS.PatBind{} = unsupported "pattern binding"
+-- matches if the list of HS.Matches is empty
 cpsBinding HS.FunBind{} = error "cpsBinding: function decl with no clauses"
 cpsBinding _ = pure Nothing
+
+-- | CPS all of the FunBinds and PatBinds in a list of Decls. Everything
+-- else is thrown away.
+cpsBindings :: [HS.Decl ann] -> CPSM [CpsBinding]
+cpsBindings = fmap catMaybes . mapM cpsBinding
 
 -- | Convert a Match to an Alt
 -- More or less just throws away the normal/infix distinction
@@ -478,15 +505,25 @@ at its binding site and everywhere it is used.
 -- (this is a common abbreviation in compilers)
 type Rn = State Int
 
+runRn :: Rn a -> a
+runRn = flip evalState 0
+
 freshRn :: Name -> Rn Unique
 freshRn = fresh Renaming
+
+-- | Rename all bound variables in a Binding. This results in renaming the
+-- arguments of the binding, if it had any, but not the binding itself.
+-- Intended for global bindings; local bindings are handled by a call to
+-- 'renameThingMany' in 'renameSubexp'.
+renameBinding :: CpsBinding -> Rn CpsBinding
+renameBinding (Binding bndr k body) = Binding bndr k <$> renameExp body
 
 -- | Rename all bound variables in an entire CpsExp to disambiguate them.
 -- In the resulting CpsExp, the only raw binders are free variables of the
 -- input.
-renameExp :: CpsExp -> CpsExp
+renameExp :: CpsExp -> Rn CpsExp
 -- transformM works bottom-up, which correctly handles shadowing naturally!
-renameExp = flip evalState 0 . transformM renameSubexp
+renameExp = transformM renameSubexp
 
 -- | Replace all instances of the given raw name in binders with
 -- the given unique.
@@ -520,6 +557,14 @@ renameSubexp exp = case exp of
       -- don't rename the continuation, because the binders don't
       -- scope over it!
       return $ LamCps rpat var rbody k
+    LetCps binds body -> do
+      let nameOfBind (Binding name _ _) = name
+          boundNames = map nameOfBind binds
+      renamePairs <- mapM (toSndM freshRn) $ catRaws boundNames
+      -- This time, we rename ALL of the binders, their bodies,
+      -- AND the body of the let itself. Haskell let-bindings
+      -- are recursive!
+      return $ renameThingMany renamePairs exp -- thing ~ CpsExp
 
 -- | 'renameSubExp' for clauses.
 renameClause :: Clause -> Rn Clause
@@ -534,10 +579,11 @@ bindersInPat = toListOf biplate
 -- | 'bindersInPat', but only the raw binders.
 rawBindersInPat :: CpsPat -> [Name]
 rawBindersInPat = catRaws . bindersInPat
-  where
-    catRaws [] = []
-    catRaws (BindRaw name : rest) = name : catRaws rest
-    catRaws (BindUnq _    : rest) = catRaws rest
+
+catRaws :: [Binder] -> [Name]
+catRaws [] = []
+catRaws (BindRaw name : rest) = name : catRaws rest
+catRaws (BindUnq _    : rest) = catRaws rest
 
 -- | For each raw binder in the pattern, generate a fresh unique.
 renamesForPat :: CpsPat -> Rn [(Name, Unique)]
@@ -552,9 +598,6 @@ toSndM f a = (a,) <$> f a
 
 -- Debugging; we don't need a whole pretty printer, just enough
 -- to be able to read what's going on.
-showWithContinuation :: CpsCont -> ShowS -> ShowS
-showWithContinuation c@(VarCont _)  a = shows c . showString " $ " . a
-showWithContinuation c@(FnCont _ _) a = a . showString " & " . shows c
 
 instance Show SimpleExp where
   show Const = "AConst"
@@ -599,6 +642,10 @@ intercalateS sep = go
         go [s]    = s
         go (s:ss) = s . showString sep . go ss
 
+showWithContinuation :: CpsCont -> ShowS -> ShowS
+showWithContinuation c@(VarCont _)  a = shows c . showString " $ " . a
+showWithContinuation c@(FnCont _ _) a = a . showString " & " . shows c
+
 instance Show CpsExp where
   showsPrec _ (SimpleExpCps e k) = showWithContinuation k (shows e)
   showsPrec _ (MatchCps e clauses) = showString "case " . shows e
@@ -612,10 +659,14 @@ instance Show CpsExp where
   showsPrec _ (LamCps pat kv e k) = showWithContinuation k $
     showParen True $ showChar '\\' . shows pat . showChar ' '
     . shows kv . showString " -> " . shows e
+  showsPrec _ (LetCps binds body) = 
+      showString "let { "
+    . intercalateS "; " (map shows binds)
+    . showString " } in " . shows body
 
 instance Show CpsBinding where
   showsPrec _ (Binding name kvar exp) =
-    showString name . showChar ' ' . shows kvar
+    shows name . showChar ' ' . shows kvar
     . showString " = " . shows exp
 
 showClause :: (CpsPat, CpsExp) -> ShowS
