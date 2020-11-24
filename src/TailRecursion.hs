@@ -5,6 +5,16 @@ import CPS
 import Control.Lens.Fold (anyOf)
 import Data.Data.Lens (biplate)
 
+-- | TODO: I think everything gets cleaner if 'onlyTailCalls' recurses
+-- into the LetCps _body_ but not the bindings themselves. Even the current
+-- version would perhaps get somewhat cleaer.
+-- Then with fgl:
+-- we simply extract every single binding in an entire module, construct
+-- the call graph, compute the condensation, and for each binding, its body
+-- 'onlyTailCalls' the other bindings in its SCC.
+-- An entire SCC is bad if any single binding in the SCC is bad or if any
+-- binding in the SCC calls a binding in a bad SCC.
+
 data Truth
   = Holds
   | Vacuous
