@@ -253,5 +253,5 @@ cpsTailRecursiveTests = testGroup "cpsTailRecursive" $ map check
     , Fails)
   ]
   where check (desc, src, expected) =
-          let Binding name _ body = processDecl src
-          in testCase desc $ expected @=? cpsTailRecursive body [name]
+          let binding = processDecl src
+          in testCase desc $ expected @=? bindingTailRecursive binding
