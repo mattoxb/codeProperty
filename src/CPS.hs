@@ -119,6 +119,9 @@ to make the order of evaluation in the body explicit.
 data CpsBinding = Binding Binder ContVar CpsExp
   deriving (Eq, Typeable, Data)
 
+binderOfBinding :: CpsBinding -> Binder
+binderOfBinding (Binding bndr _ _) = bndr
+
 -------------------------------------------------------------------------------
 -- CPS Transform
 -------------------------------------------------------------------------------
@@ -319,12 +322,8 @@ cpsExp HS.Lit{} k = error "cpsExp: isSimple missed a Lit!"
 
 -- | CPS an alternative in a 'case' statement.
 cpsAlt :: HS.Alt ann -> CpsCont -> CPSM (CpsPat, CpsExp)
--- we should be able to support this by just wrapping the cps'd RHS in
--- a 'let binds in rhs'-style expression. Guards cause the RHS to turn
--- into a case statement so putting let bindings before that should work.
-cpsAlt (HS.Alt _ pat rhs (Just binds)) k =
-  (asCpsPat pat,) <$> cpsRhsWithLocals (Just binds) rhs k
-cpsAlt (HS.Alt _ pat rhs Nothing)  k = (asCpsPat pat,) <$> cpsRhs rhs k
+cpsAlt (HS.Alt _ pat rhs mbinds) k =
+  (asCpsPat pat,) <$> cpsRhsWithLocals mbinds rhs k
 
 -- | CPS the RHS of a decl or 'case' alternative.
 -- BREAKS SEMANTICS: treats guards as a nested pattern match
@@ -342,6 +341,10 @@ cpsRhs (HS.GuardedRhss _ grhss) k = do
     cpsMultiExp GuardMEC guardExps $
       FnCont unused $ MatchCps Const cpsRhsClauses
 
+-- | 'cpsRhs', but wraps the rhs in a let expression if there are bindings.
+-- If the 'rhs' has guards, the guards are CPS'd as a case statement, and the
+-- case statement will end up in the body of the let-expression, which
+-- handles scope correctly.
 cpsRhsWithLocals :: Maybe (HS.Binds ann)
                  -> HS.Rhs ann 
                  -> CpsCont 
@@ -350,7 +353,7 @@ cpsRhsWithLocals Nothing rhs k = cpsRhs rhs k
 cpsRhsWithLocals (Just (HS.BDecls _ decls)) rhs k = do
   binds <- cpsBindings decls
   case binds of
-    [] -> cpsRhs rhs k -- I'm not actually convinced this is possible
+    [] -> cpsRhs rhs k
     bs -> LetCps bs <$> cpsRhs rhs k
 cpsRhsWithLocals (Just HS.IPBinds{}) rhs k = 
   unsupported "implicit parameter binding"

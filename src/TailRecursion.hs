@@ -21,6 +21,10 @@ instance Semigroup Truth where
 instance Monoid Truth where
   mempty = Vacuous
 
+holds :: Truth -> Bool
+holds Holds = True
+holds _     = False
+
 -- | Determine if the given CpsExp only refers to the given binders
 -- in tail positions. In other words, all references are tail references.
 --
@@ -86,3 +90,46 @@ refersTo e bs = anyOf biplate (`elem` map Var bs) e
 
 bindRefersTo :: CpsBinding -> [Binder] -> Bool
 bindRefersTo (Binding _ _ body) = refersTo body
+
+cpsTailRecursive :: CpsExp -> [Binder] -> Truth
+cpsTailRecursive e bs = case onlyTailCalls e bs of
+    (Fails, _)    -> Fails
+    (truth, [])   -> truth
+    (truth, lcls) -> goLocals truth lcls
+  where
+    goLocals truth lcls = truth <> foldMap goLocal lcls
+    goLocal (LetCps bindings body) = localsTailRecursive bindings body bs
+    goLocal _ = error "goLocal: exp is not a LetCps"
+
+localsTailRecursive :: [CpsBinding] -> CpsExp -> [Binder] -> Truth
+localsTailRecursive bindings lbody bndrs = 
+  mconcat bindingTruths <> cpsTailRecursive lbody bndrs
+  where
+    bsWithTruth = map (toSnd goBinding) bindings
+    -- handing down the rest of the binders here is kind of a naive mutual
+    -- recursion check, so a full & proper mutual recursion check should
+    -- probably _replace_ that, rather than only adding new code.
+    goBinding (Binding bndr _ body) = cpsTailRecursive body (bndr:bndrs)
+
+    bindingTruths = map snd bsWithTruth
+
+-- | Check if a CpsBinding is tail recursive. We define tail recursive as
+-- "the function **or a local binding** is recursive and all recursive calls
+-- are tail calls."
+--
+-- Currently, can be fooled by mutual recursion (may return Vacuous when
+-- Holds is expected). Additionally, can theoretically be fooled by an
+-- unused tail recursive local binding combined with a call to a
+-- non-tail-recursive function bound elsewhere. Therefore, it is a good
+-- idea to analyze the whole module, and reject if any bindings Fail the
+-- check. However I'm not implementing that at the moment because mutual
+-- recursion pieces would likely create a more elegant solution to the same
+-- problem.
+bindingTailRecursive :: CpsBinding -> Truth
+bindingTailRecursive (Binding name _ body) = cpsTailRecursive body [name]
+
+-- tailRecursiveInModule :: [CpsBinding] -> Name -> Bool
+-- TODO: implement this either with or without call graph analysis.
+
+toSnd :: (a -> b) -> a -> (a, b)
+toSnd f x = (x, f x)

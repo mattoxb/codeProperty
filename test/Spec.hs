@@ -18,10 +18,11 @@ main :: IO ()
 main = defaultMain hunitTests
 
 hunitTests = testGroup "HUnit tests"
-  [ checkRecursiveTests
-  , checkTailTests
-  , refersToTests
+  [ --checkRecursiveTests
+  --, checkTailTests
+  {-,-} refersToTests
   , onlyTailCallsNoLetTests
+  , cpsTailRecursiveTests
   ]
 
 checkRecursiveTests = testGroup "checkRecursive tests"
@@ -152,6 +153,12 @@ processExp src = case Parse.parseExp src of
     in cpsRN
   Parse.ParseFailed{} -> error "processExp: couldn't parse exp source"
 
+processDecl src = case Parse.parseDecl src of
+  Parse.ParseOk d -> case runCPSM $ cpsBinding d of
+    Just bind -> runRn $ renameBinding bind
+    Nothing   -> error "processDecl: decl is not a binding"
+  Parse.ParseFailed{} -> error "processDecl: couldn't parse decl source"
+
 testFromSource :: (Eq result, Show result)
                => (CpsExp -> [Binder] -> result)
                -> (Desc, [Name], Source, result) -> TestTree
@@ -162,7 +169,7 @@ onlyTailCallsNoLetTests :: TestTree
 onlyTailCallsNoLetTests = testGroup "onlyTailCalls (no let)" $ map check
   [ ("simple example", ["rev"], "rev (x:acc) xs", Holds)
   , ("tail call inside lambda 1", ["rev"], "(\\() -> rev) (x:acc) xs", Fails)
-  , ("tail call inside lambda 2", ["foo"], "\x -> foo ()", Holds)
+  , ("tail call inside lambda 2", ["foo"], "\\x -> foo ()", Holds)
   , ("reverse", ["rev"], revBody, Holds)
   , ("vacuous 1", [], "(foo x, bar y, [1, 2, z])", Vacuous)
   , ("vacuous 2", ["doesNotAppear"], "tail (x+y)", Vacuous)
@@ -180,7 +187,7 @@ onlyTailCallsNoLetTests = testGroup "onlyTailCalls (no let)" $ map check
   where revBody = "case lst of [] -> acc; (x:xs) -> rev (x:acc) xs"
 
         -- onlyTailCalls returns (Truth, [CpsExp]) 
-        -- but we only care about the Truth.
+        -- but we only care about the Truth here.
         check = testFromSource $ \e bs -> fst $ onlyTailCalls e bs
 
 refersToTests :: TestTree
@@ -207,3 +214,44 @@ refersToTests = testGroup "refersTo" $ map check
   , ("contains none", ["foo", "bar", "baz"], "x ()", False)
   ]
   where check = testFromSource refersTo
+
+-- this one doesn't test mutual recursion
+cpsTailRecursiveTests :: TestTree
+cpsTailRecursiveTests = testGroup "cpsTailRecursive" $ map check
+  [ ("simple holds", "go acc [] = acc\ngo acc (x:xs) = go (x:acc) xs", Holds)
+  , ("simple vacuous", "rev = reverse", Vacuous)
+  , ("simple fails", "rev = const reverse $ rev", Fails)
+  , ( "local binding holds"
+    , "rev = go [] where\n  go acc [] = acc\n  go acc (x:xs) = go (x:acc) xs"
+    , Holds)
+  , ( "tail recursive map"
+    , unlines [ "map f = reverse . go [] where" -- note 'go' not tail called
+              , "  go acc [] = acc"
+              , "  go acc (x:xs) = go (f x : acc) xs" ]
+    , Holds)
+  , ( "nested local"
+    , unlines [ "foo = go [] where"
+              , "  go = bar where"
+              , "    bar acc [] = acc"
+              , "    bar acc (x:xs) = bar (x:acc) xs" ]
+    , Holds)
+  , ("direct recursive local", "foo = bar where bar = 0:bar", Fails)
+  , ( "complex direct recursive local"
+    , unlines [ "filter p = go where"
+              , "  go [] = []"
+              , "  go (x:xs) | p x = x : go xs"
+              , "            | otherwise = go xs" ]
+    , Fails)
+  , ( "good and bad locals"
+    , unlines [ "filter p = good [] where"
+              , "  good acc [] = acc"
+              , "  good acc (x:xs) | p x = good (x:acc) xs"
+              , "                  | otherwise = good acc xs"
+              , "  bad [] = []"
+              , "  bad (x:xs) | p x = x : bad xs"
+              , "             | otherwise = bad xs" ]
+    , Fails)
+  ]
+  where check (desc, src, expected) =
+          let Binding name _ body = processDecl src
+          in testCase desc $ expected @=? cpsTailRecursive body [name]
