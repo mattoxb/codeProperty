@@ -1,15 +1,15 @@
 module ContainsListComp (containsListComp) where
 
-import Control.Lens.Plated (Plated, cosmos)
-import Control.Lens.Fold   (anyOf)
-import Data.Data
-import Language.Haskell.Exts.Syntax
+import Control.Lens.Fold (anyOf)
+import Control.Lens.Plated (cosmos)
+import Data.Data (Data)
+import HSEExtra ()
 
-import HSEExtra () -- Plated instance
+import Language.Haskell.Exts.Syntax (Exp (ListComp))
 
 isListComp :: Exp ann -> Bool
-isListComp ListComp{} = True
-isListComp _          = False
+isListComp ListComp {} = True
+isListComp _ = False
 
 -- | Does exactly what it says on the tin.
 containsListComp :: Data ann => Exp ann -> Bool

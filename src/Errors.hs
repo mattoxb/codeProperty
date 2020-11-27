@@ -5,7 +5,7 @@ specificUnsupportedMsg :: String -> String
 (genericUnsupportedMsg, specificUnsupportedMsg) =
   (prefix ++ " (perhaps a syntax error?)", \reason -> prefix ++ ": " ++ reason)
   where
-    prefix = "CodeProperty encountered something it doesn't support"
+    prefix = "CodeProperty encountered something it doesn't understand"
 
 unsupported :: String -> a
 unsupported = error . specificUnsupportedMsg

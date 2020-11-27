@@ -8,8 +8,9 @@ an orphan Plated instance so it belongs here too.
 {-# LANGUAGE FlexibleInstances #-}
 module HSEExtra where
 
-import Control.Lens.Plated
-import Data.Data
+import Control.Lens.Plated (Plated)
+import Data.Functor (void)
+import Data.Data (Data)
 
 import qualified Language.Haskell.Exts as HS
 
@@ -35,7 +36,7 @@ instance HasName (HS.QName ann) where
     HS.TupleCon _ HS.Boxed n -> "(" ++ replicate (n-1) ',' ++ ")"
     -- other things should only appear in types as far as I can tell.
     other -> error $ "flatName@QName: can't handle " ++ 
-                     show (fmap (const ()) other)
+                     show (void other)
 
 instance HasName (HS.QOp ann) where
   flatName (HS.QVarOp _ name) = flatName name

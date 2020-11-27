@@ -4,8 +4,8 @@
 
 module CPS where
 
-import Errors
-import HSEExtra
+import Errors (unsupported)
+import HSEExtra (HasName(flatName))
 
 import           Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.List.NonEmpty as NE
@@ -13,7 +13,8 @@ import Data.Data (Data, Typeable)
 import Data.Maybe (catMaybes)
 
 import Control.Monad.State.Strict
-import Control.Lens hiding (Const)
+    (evalState, MonadState(state), State)
+import Control.Lens (transformM, Plated, toListOf, (%~))
 import Data.Data.Lens (biplate)
 
 import qualified Language.Haskell.Exts as HS
@@ -312,8 +313,7 @@ cpsExp HS.LeftArrApp{}      k = unsupported "arrow syntax"
 cpsExp HS.RightArrApp{}     k = unsupported "arrow syntax"
 cpsExp HS.LeftArrHighApp{}  k = unsupported "arrow syntax"
 cpsExp HS.RightArrHighApp{} k = unsupported "arrow syntax"
--- looks like we have an outdated haskell-src-exts that predates this
--- cpsExp HS.ArrOp{}           k = unsupported "arrow syntax"
+cpsExp HS.ArrOp{}           k = unsupported "arrow syntax"
 cpsExp HS.LCase{} k = unsupported "lambda case"
 -- These last 3 are to shut up the pattern match exhaustiveness warning.
 cpsExp HS.Var{} k = error "cpsExp: isSimple missed a Var!"

@@ -1,0 +1,13 @@
+cradle:
+  stack:
+    - path: "./src"
+      component: "codeProperty:lib"
+
+    - path: "./app/Main.hs"
+      component: "codeProperty:exe:codeProperty-exe"
+
+    - path: "./app/Paths_codeProperty.hs"
+      component: "codeProperty:exe:codeProperty-exe"
+
+    - path: "./test"
+      component: "codeProperty:test:codeProperty-test"
