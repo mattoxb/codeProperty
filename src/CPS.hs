@@ -22,9 +22,9 @@ import qualified Language.Haskell.Exts as HS
 type Name = String
 type Op   = Name
 
--- | a fresh name generated during CPS or tail recursion
--- detection. Differentiating between these and source Vars
--- is not strictly necessary but makes renaming much easier,
+-- | a fresh name generated during CPS or renaming.
+-- Differentiating between these and source Vars
+-- is not strictly necessary but makes life much easier,
 -- allowing us to worry less while detecting tail recursion.
 data Unique = Unique Provenance Name !Int
   deriving (Eq, Typeable, Data)
