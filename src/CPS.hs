@@ -271,10 +271,17 @@ cpsExp HS.TupleSection{} k = unsupported "tuple section"
 cpsExp (HS.List _ exps) k = cpsMultiExp ListMEC exps k
 cpsExp HS.ParArray{} k = unsupported "parallel array"
 cpsExp (HS.Paren _ e) k = cpsExp e k
--- sections SHOULD be easy, so TODO. They also should be handled by collectApp,
--- but honestly, who writes '(1+) 2' in real code?
-cpsExp HS.LeftSection{} k = unsupported "operator section"
-cpsExp HS.RightSection{} k = unsupported "operator section"
+cpsExp (HS.LeftSection _ e op) k = cpsValue e "a" $ \se ->
+  AppCps (Var (BindRaw name)) [se] k
+  where name = flatName op
+cpsExp (HS.RightSection _ op e) k = cpsValueM e "a" $ \se -> do
+  p <- freshCPS "p"
+  kvar <- freshKVar
+  let pat = VarPat $ BindUnq p
+  let body = AppCps (Var (BindRaw name)) [mkUnqVar p, se] k
+  return $ LamCps pat kvar body k
+  where name = flatName op
+  
 cpsExp HS.RecConstr{} k = unsupported "record construction"
 cpsExp HS.RecUpdate{} k = unsupported "record update"
 -- The 'EnumX' family are semantics breaking in the same way as 'List'
@@ -393,6 +400,11 @@ collectApp = go
         go (HS.Paren _ e) = go e
 
         go (HS.InfixApp _ l op r) = (HS.Var ann name, [r, l])
+          where (ann, name) = case op of
+                  HS.QVarOp ann name -> (ann, name)
+                  HS.QConOp ann name -> (ann, name)
+
+        go (HS.LeftSection _ e op) = (HS.Var ann name, [e])
           where (ann, name) = case op of
                   HS.QVarOp ann name -> (ann, name)
                   HS.QConOp ann name -> (ann, name)
