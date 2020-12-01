@@ -35,6 +35,10 @@ holds :: Truth -> Bool
 holds Holds = True
 holds _     = False
 
+fails :: Truth -> Bool
+fails Fails = True
+fails _     = False
+
 -- | Determine if the given CpsExp only refers to the given binders
 -- in tail positions. In other words, all references are tail references.
 --
@@ -58,7 +62,7 @@ onlyTailCalls exp binders = go exp
     go (SimpleExpCps se (FnCont _ ke)) = guardSafe (safe se) <> go ke
     go (MatchCps se cs) =
       -- patterns can't refer to things
-      guardSafe (safe se) <>  foldMap go (map snd cs)
+      guardSafe (safe se) <> foldMap (go . snd) cs
     go (AppCps head args (VarCont _)) =
       guardTarget (target head) <> guardSafe (all safe args)
     go (AppCps head args (FnCont _ ke)) =
@@ -81,10 +85,16 @@ onlyTailCalls exp binders = go exp
     target = (`elem` targets)
     safe = (`notElem` targets)
 
+-- | Guard for non-tail positions. The 'Bool' is intended to indicate
+-- that a name is not one of the target names. A target name in a non-tail
+-- position means the check Fails.
 guardSafe :: Bool -> (Truth, [a])
 guardSafe True  = (Vacuous, [])
 guardSafe False = (Fails,   [])
 
+-- | Guard for tail positions. The 'Bool' is intended to indicate
+-- that a name is one of the target names. A target name in a tail position
+-- means the check Holds.
 guardTarget :: Bool -> (Truth, [a])
 guardTarget True  = (Holds,   [])
 guardTarget False = (Vacuous, [])
@@ -138,8 +148,19 @@ localsTailRecursive bindings lbody bndrs =
 bindingTailRecursive :: CpsBinding -> Truth
 bindingTailRecursive (Binding name _ body) = cpsTailRecursive body [name]
 
--- tailRecursiveInModule :: [CpsBinding] -> Name -> Bool
--- TODO: implement this either with or without call graph analysis.
+tailRecursiveInModule :: CpsModule -> [Name] -> Bool
+tailRecursiveInModule modBindings toCheck
+  | anyFail = False
+  | otherwise = checkSucceeds
+  where
+    truths = map (toSnd bindingTailRecursive) modBindings
+    anyFail = any (fails . snd) truths
+
+    truthsToCheck = filter ((`elem` toCheck) . nameOfBinding . fst) truths
+    checkSucceeds = all (holds . snd) truthsToCheck
+
+    nameOfBinding (Binding (BindRaw name) _ _) = name
+    nameOfBinding Binding{} = error "nameOfBinding: binding is not top-level"
 
 toSnd :: (a -> b) -> a -> (a, b)
 toSnd f x = (x, f x)

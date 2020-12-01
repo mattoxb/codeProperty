@@ -123,6 +123,8 @@ data CpsBinding = Binding Binder ContVar CpsExp
 binderOfBinding :: CpsBinding -> Binder
 binderOfBinding (Binding bndr _ _) = bndr
 
+type CpsModule = [CpsBinding]
+
 -------------------------------------------------------------------------------
 -- CPS Transform
 -------------------------------------------------------------------------------
@@ -178,11 +180,11 @@ asSimpleExp e | isSimple e = Const
 -- The argument string is a prefix for the fresh var, if one is needed.
 -- That's mostly useful for debugging.
 --
--- E.X. 'cpsExp (-e) k' can be expressed as
---  cpsValueM e "v" $ \se -> pure (AppCps (Var "negate") se k)
--- If 'e' is constant this would give AppCps (Var "negate") Const k.
--- If 'e' were, say, 'f x', this would give
---   AppCps (Var "f") (Var "x") $ FN v%1 -> AppCps (Var "negate") (Var v%1) k.
+-- E.X. @cpsExp (-e) k@ can be expressed as
+--  @cpsValueM e "v" $ \se -> pure (AppCps (Var "negate") se k)@.
+-- If 'e' is constant this would give @AppCps (Var "negate") Const k@.
+-- If 'e' were, say, @f x@, this would give
+--   @AppCps (Var "f") (Var "x") $ FN v%1 -> AppCps (Var "negate") (Var v%1) k@.
 cpsValueM :: HS.Exp ann -> String -> (SimpleExp -> CPSM CpsExp) -> CPSM CpsExp
 cpsValueM e pre consumer
   | isSimple e = consumer (asSimpleExp e)
@@ -446,6 +448,17 @@ cpsBinding _ = pure Nothing
 cpsBindings :: [HS.Decl ann] -> CPSM [CpsBinding]
 cpsBindings = fmap catMaybes . mapM cpsBinding
 
+-- | CPS an entire 'HS.Module'. Ignores everything that is not a function
+-- or pattern binding.
+cpsModule :: HS.Module ann -> CPSM CpsModule
+cpsModule (HS.Module _ _mhead _pragmas _imports decls) = cpsBindings decls
+cpsModule HS.XmlPage{}   = unsupported "XML module"
+cpsModule HS.XmlHybrid{} = unsupported "XML module"
+
+-- | Execute the CPS Transformation of a whole module.
+cpsTransformModule :: HS.Module ann -> CpsModule
+cpsTransformModule = runCPSM . cpsModule
+
 -- | Convert a Match to an Alt
 -- More or less just throws away the normal/infix distinction
 matchAsAlt :: HS.Match ann -> HS.Alt ann
@@ -513,6 +526,10 @@ runRn = flip evalState 0
 
 freshRn :: Name -> Rn Unique
 freshRn = fresh Renaming
+
+-- | Rename an entire module of CpsBindings.
+renameModule :: CpsModule -> CpsModule
+renameModule = runRn . mapM renameBinding
 
 -- | Rename all bound variables in a Binding. This results in renaming the
 -- arguments of the binding, if it had any, but not the binding itself.

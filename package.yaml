@@ -21,6 +21,7 @@ description:         Please see the README on GitHub at <https://github.com/gith
 
 dependencies:
 - base >= 4.7 && < 5
+- filepath
 - haskell-src-exts
 - lens
 - mtl
@@ -32,7 +33,7 @@ library:
   source-dirs: src
 
 executables:
-  codeProperty-exe:
+  codeProperty:
     main:                Main.hs
     source-dirs:         app
     ghc-options:

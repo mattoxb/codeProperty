@@ -4,10 +4,10 @@ cradle:
       component: "codeProperty:lib"
 
     - path: "./app/Main.hs"
-      component: "codeProperty:exe:codeProperty-exe"
+      component: "codeProperty:exe:codeProperty"
 
     - path: "./app/Paths_codeProperty.hs"
-      component: "codeProperty:exe:codeProperty-exe"
+      component: "codeProperty:exe:codeProperty"
 
     - path: "./test"
       component: "codeProperty:test:codeProperty-test"
