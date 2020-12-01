@@ -8,12 +8,15 @@ are tail-recursive. The syntax is
 $ codeProperty filepath name1 name2...
 ```
 
-Where the `name`s are the names of the functions to check. `codeProperty` won't
+Where the `name`s are the names of the functions to check. 
+
+`codeProperty` won't
 allow _any_ functions in the module to be directly recursive, but will allow
 other functions to be tail-recursive or non-recursive. Therefore, it's
 recommended that you make sure the standard `Prelude` higher order functions
 such as `map` and `filter` are not imported in the module being checked.
-`codeProperty` won't check for that itself.
+`codeProperty` won't check for that itself. However `codeProperty` will
+identify and reject list comprehensions.
 
 There are still a few ways to fool `codeProperty` but they would essentially
 require being able to write a properly tail-recursive function anyways.
