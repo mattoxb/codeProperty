@@ -278,7 +278,7 @@ cpsExp (HS.RightSection _ op e) k = cpsValueM e "a" $ \se -> do
   p <- freshCPS "p"
   kvar <- freshKVar
   let pat = VarPat $ BindUnq p
-  let body = AppCps (Var (BindRaw name)) [mkUnqVar p, se] k
+  let body = AppCps (Var (BindRaw name)) [mkUnqVar p, se] (VarCont kvar)
   return $ LamCps pat kvar body k
   where name = flatName op
   
