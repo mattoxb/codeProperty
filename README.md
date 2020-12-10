@@ -41,6 +41,6 @@ testModuleFromFile :: FilePath -> [Name] -> IO Bool
 ```
 
 which is essentially the same as the `codeProperty` executable itself. However,
-be aware that errors will still be raised asynchronously instead of returning
-`False`. A future release may come with a proper library that can be used 
-directly in test suites for programming classes.
+be aware that errors will still be raised (synchronously) instead of returning
+`False`. Any of the usual Haskell unit testing libraries should be equipped to
+handle this behavior.
