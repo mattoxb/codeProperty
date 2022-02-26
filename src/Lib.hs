@@ -7,6 +7,7 @@ import qualified Language.Haskell.Exts as HS
 import ContainsListComp (containsListComp)
 import TailRecursion (tailRecursiveInModule)
 import CPS (CpsModule, Name, renameModule, cpsTransformModule)
+import CallGraph
 
 -- | Process a parsed Haskell module to make it suitable for use in the
 -- tail recursion checker.
@@ -37,3 +38,14 @@ testModuleFromFile :: FilePath -> [Name] -> IO Bool
 testModuleFromFile fpath names = do
   modsrc <- getModuleSource fpath
   return $ testModule (parseModuleSource modsrc) names
+
+graphFromFile :: FilePath -> IO ()
+graphFromFile fpath = do
+  modsrc <- getModuleSource fpath
+  let mod = parseModuleSource modsrc
+  case processModule mod of
+    Nothing -> return ()
+    Just cpsMod -> do
+      print cpsMod
+      let (graph, ctx) = buildGraph emptyContext cpsMod
+      print graph
