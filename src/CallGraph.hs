@@ -16,7 +16,11 @@ newtype Vertex = Vertex [Binder]
   deriving (Eq)
 
 -- | Call graphs are represented as lists of vertices and directed edges.
-data CallGraph = CallGraph { vertices :: [Vertex], edges :: [(Vertex, Vertex)] }
+data CallGraph = CallGraph { 
+  vertices :: [Vertex], 
+  calls :: [(Vertex, Vertex)],
+  tailCalls :: [(Vertex, Vertex)]
+}
   deriving (Eq)
 
 instance Show Vertex where
@@ -24,24 +28,28 @@ instance Show Vertex where
   show (Vertex (x:xs)) = show x ++ "." ++ show (Vertex xs)
 
 instance Show CallGraph where
-  show (CallGraph vertices edges) =
+  show (CallGraph vertices calls tailCalls) =
     "Vertices: " ++ show vertices ++ "\n" ++
     "Edges:\n\t" ++ intercalate "\n\t" arrows
     where
-      arrow (v1, v2) = show v1 ++ " -> " ++ show v2
-      arrows = map arrow edges
+      arrow1 (v1, v2) = show v1 ++ " -call-> " ++ show v2
+      arrow2 (v1, v2) = show v1 ++ " -tail-> " ++ show v2
+      arrows = map arrow1 calls ++ map arrow2 tailCalls
 
 emptyGraph :: CallGraph
-emptyGraph = CallGraph [] []
+emptyGraph = CallGraph [] [] []
 
 addVertex :: Vertex -> CallGraph -> CallGraph
-addVertex v (CallGraph vs es) = CallGraph (v:vs) es
+addVertex v (CallGraph vs es1 es2) = CallGraph (v:vs) es1 es2
 
-addEdge :: (Vertex, Vertex) -> CallGraph -> CallGraph
-addEdge e@(v1, v2) (CallGraph vs es) = CallGraph (union [v1,v2] vs) (e:es)
+addCall :: (Vertex, Vertex) -> CallGraph -> CallGraph
+addCall e@(v1, v2) (CallGraph vs es1 es2) = CallGraph (union [v1,v2] vs) (e:es1) es2
+
+addTailCall :: (Vertex, Vertex) -> CallGraph -> CallGraph
+addTailCall e@(v1, v2) (CallGraph vs es1 es2) = CallGraph (union [v1,v2] vs) es1 (e:es2)
 
 mergeGraphs :: CallGraph -> CallGraph -> CallGraph
-mergeGraphs g1 g2 = CallGraph (vertices g1 `union` vertices g2) (edges g1 `union` edges g2)
+mergeGraphs g1 g2 = CallGraph (vertices g1 `union` vertices g2) (calls g1 `union` calls g2) (tailCalls g1 `union` tailCalls g2)
 
 merge :: [CallGraph] -> CallGraph
 merge = foldr mergeGraphs emptyGraph
@@ -107,10 +115,14 @@ buildGraphFromExp ctx exp = case exp of
             let ctx' = updateScope (toScope ctx pat) ctx
             in buildGraphFromExp ctx' exp
 
-  AppCps (Var f) _ k -> addEdge (caller, callee) subgraph
+  AppCps (Var f) _ k -> 
+    if isTailCall 
+      then addTailCall (caller, callee) subgraph
+      else addCall (caller, callee) subgraph
     where caller = parent ctx
           callee = lookupID ctx f
           subgraph = buildGraphFromCont ctx k
+          isTailCall = case k of VarCont {} -> True; FnCont {} -> False
 
   -- I *think* that applying a constant means that the code doesn't compile.
   -- Let's just ignore it.
@@ -145,9 +157,3 @@ toScope ctx pat =
   AsPat  x pat -> (x, toVertex ctx x) : toScope ctx pat
   TuplePat pats -> concatMap (toScope ctx) pats
   ConstrPat _ pats -> concatMap (toScope ctx) pats
-
-
--- 
--- INTERFACE
---
-
