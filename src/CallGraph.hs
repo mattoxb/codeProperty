@@ -4,6 +4,7 @@
 module CallGraph where
 import CPS
 import Data.List
+import TailRecursion
 
 ------------
 -- GRAPHS --
@@ -16,8 +17,8 @@ newtype Vertex = Vertex [Binder]
   deriving (Eq)
 
 -- | Call graphs are represented as lists of vertices and directed edges.
-data CallGraph = CallGraph { 
-  vertices :: [Vertex], 
+data CallGraph = CallGraph {
+  vertices :: [Vertex],
   calls :: [(Vertex, Vertex)],
   tailCalls :: [(Vertex, Vertex)]
 }
@@ -115,8 +116,8 @@ buildGraphFromExp ctx exp = case exp of
             let ctx' = updateScope (toScope ctx pat) ctx
             in buildGraphFromExp ctx' exp
 
-  AppCps (Var f) _ k -> 
-    if isTailCall 
+  AppCps (Var f) _ k ->
+    if isTailCall
       then addTailCall (caller, callee) subgraph
       else addCall (caller, callee) subgraph
     where caller = parent ctx
@@ -157,3 +158,63 @@ toScope ctx pat =
   AsPat  x pat -> (x, toVertex ctx x) : toScope ctx pat
   TuplePat pats -> concatMap (toScope ctx) pats
   ConstrPat _ pats -> concatMap (toScope ctx) pats
+
+
+----
+-- Checker
+----
+
+-- | As we do DFS on the call graph, the breadcrumbs keeps track of the vertices
+-- and edges we've already seen. A trail [(v1, true), (v2, false)] indicates
+-- that (1) v1 called v2 tail recursively, and (2) v2 called us not-tail-recursively.
+type BreadCrumbs = [(Vertex, Bool)]
+
+contains :: BreadCrumbs -> Vertex -> Bool
+contains crumbs v = any ((==) v . fst) crumbs
+
+-- | Assuming there is a cycle, i.e. crumbs `contains` v, check whether the
+-- cycle contains any non-tail calls.
+diagnoseCycle :: BreadCrumbs -> Vertex -> Bool -> Truth
+diagnoseCycle crumbs v isTailCall =
+  -- If v is not being called tail recursively, then clearly we have 
+  -- a non-tail-recursive cycle!
+  if not isTailCall then Fails else
+  -- Otherwise, check whether any of the calls from v were non-tail-calls.
+  let suffix = dropWhile ((/=) v . fst) crumbs
+      anyBadCalls = any ((==) False . snd) suffix
+  in
+  if anyBadCalls then Fails else Holds
+
+
+-- | Checks whether the given function is tail recursive in the call graph.
+-- If the function cannot reach any cycles, return `Vacuous` (not recursive).
+-- If the function can reach a cycle, but the cycle contains a non-tail call,
+-- then return `Fails` (because it uses non-tail recursion).
+-- Otherwise, return `Holds`.
+isTailRecursive :: Name -> CallGraph -> Truth
+isTailRecursive root graph = go [] (Vertex [BindRaw root]) graph
+  where
+    go :: BreadCrumbs -> Vertex -> CallGraph -> Truth
+    go crumbs vertex graph =
+      let
+        -- Find all edges from `vertex`; "good" edges are tail calls, "bad"
+        -- edges are non-tail-calls.
+        goodEdges = filter ((==) vertex . fst) (tailCalls graph)
+        badEdges  = filter ((==) vertex . fst) (calls graph)
+
+        -- Check all the outgoing edges.
+        results1 = map (recur True . snd) goodEdges
+        results2 = map (recur False . snd) badEdges
+
+        -- Process an edge from `vertex` to `nextVertex`. If `nextVertex` occurs
+        -- in the breadcrumbs, then we have a cycle; check whether it has bad
+        -- edges. Otherwise, recurse for that vertex, seeing if there are any
+        -- good or bad cycles in that subtree.
+        recur isTailCall nextVertex =
+          if crumbs `contains` nextVertex then
+            diagnoseCycle crumbs nextVertex isTailCall
+          else
+            go (crumbs ++ [(vertex, isTailCall)]) nextVertex graph
+      in
+        -- Combine all the results of the different branches.
+        mconcat results1 <> mconcat results2
