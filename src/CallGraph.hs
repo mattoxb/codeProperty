@@ -1,6 +1,3 @@
-{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
-{-# HLINT ignore "Use infix" #-}
-{-# OPTIONS_GHC -Wno-incomplete-patterns #-}
 module CallGraph where
 import CPS
 import Data.List
@@ -14,19 +11,20 @@ import TailRecursion
 -- A function `f` defined inside `g` defined inside `h` is represented as a
 -- list [f,g,h].
 newtype Vertex = Vertex [Binder]
-  deriving (Eq)
+  deriving Eq
 
 -- | Call graphs are represented as lists of vertices and directed edges.
+-- There are two kinds of directed edges: "tailCalls" and non-tail "calls".
 data CallGraph = CallGraph {
   vertices :: [Vertex],
   calls :: [(Vertex, Vertex)],
   tailCalls :: [(Vertex, Vertex)]
 }
-  deriving (Eq)
 
 instance Show Vertex where
+  show (Vertex [])  = error "Undefined vertex in call graph"
   show (Vertex [x]) = show x
-  show (Vertex (x:xs)) = show x ++ "." ++ show (Vertex xs)
+  show (Vertex (x:xs)) = show (Vertex xs) ++ "." ++ show x
 
 instance Show CallGraph where
   show (CallGraph vertices calls tailCalls) =
@@ -44,10 +42,10 @@ addVertex :: Vertex -> CallGraph -> CallGraph
 addVertex v (CallGraph vs es1 es2) = CallGraph (v:vs) es1 es2
 
 addCall :: (Vertex, Vertex) -> CallGraph -> CallGraph
-addCall e@(v1, v2) (CallGraph vs es1 es2) = CallGraph (union [v1,v2] vs) (e:es1) es2
+addCall e@(v1, v2) (CallGraph vs es1 es2) = CallGraph ([v1,v2] `union` vs) (e:es1) es2
 
 addTailCall :: (Vertex, Vertex) -> CallGraph -> CallGraph
-addTailCall e@(v1, v2) (CallGraph vs es1 es2) = CallGraph (union [v1,v2] vs) es1 (e:es2)
+addTailCall e@(v1, v2) (CallGraph vs es1 es2) = CallGraph ([v1,v2] `union` vs) es1 (e:es2)
 
 mergeGraphs :: CallGraph -> CallGraph -> CallGraph
 mergeGraphs g1 g2 = CallGraph (vertices g1 `union` vertices g2) (calls g1 `union` calls g2) (tailCalls g1 `union` tailCalls g2)
@@ -59,8 +57,10 @@ merge = foldr mergeGraphs emptyGraph
 -- BUILDING --
 --------------
 
--- | As we recurse, we need to know the path of binders enclosing the expression
--- and a mapping from binders to their unique identifier.
+-- | As we traverse the CPS module, we need to know all the binders enclosing
+-- the expression and maintain a mapping from binders to their unique
+-- identifier. We also maintain "path", the sequence of enclosing binders,
+-- in order to build unique identifiers.
 data Context = Context { path :: [Binder], scope :: [(Binder, Vertex)] }
   deriving (Show, Eq)
 
@@ -86,12 +86,15 @@ For each expression:
 - Create a vertex in the call graph for each top-level definition, each
   let-bound variable, and each parameter.
 - Take note of the binding in which each expression is defined.
-- Take note of the continuation associated with the binding.
 - If looking at an App expression:
   - The closest enclosing function is the caller.
   - The vertex of the called function is the callee.
-  - If the function is called with the same continuation as the caller's
-    parameter, it's a tail call. Otherwise, it's not.
+  - If the function is called with a `VarCont` continuation, then it's 
+    a tail call. (This is because in our CPS transform, the `VarCont`
+    is guaranteed to be the continuation parameter of the enclosing
+    function.) Otherwise, if the function is being called with `FnCont`,
+    then it is definitely not a tail call. (This is because the function
+    is being called with a different continuation.)
 -}
 
 buildGraph :: Context -> [CpsBinding] -> (CallGraph, Context)
@@ -129,6 +132,7 @@ buildGraphFromExp ctx exp = case exp of
   -- Let's just ignore it.
   AppCps Const _ k -> buildGraphFromCont ctx k
 
+  -- XXX What does it mean when we apply a continuation to a lambda?
   LamCps pat cv exp k -> merge [kGraph, eGraph]
     where
       ctx' = updateScope (toScope ctx pat) ctx

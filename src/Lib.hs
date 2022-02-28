@@ -39,9 +39,10 @@ testModuleFromFile fpath names = do
   modsrc <- getModuleSource fpath
   return $ testModule (parseModuleSource modsrc) names
 
-graphFromFile :: FilePath -> IO ()
-graphFromFile fpath = do
-  modsrc <- getModuleSource fpath
+graphFromFile :: FilePath -> Name -> IO ()
+graphFromFile fpath name = do
+  modsrc@(ModSrc _ contents) <- getModuleSource fpath
+  putStrLn contents
   let mod = parseModuleSource modsrc
   case processModule mod of
     Nothing -> return ()
@@ -49,3 +50,4 @@ graphFromFile fpath = do
       print cpsMod
       let (graph, ctx) = buildGraph emptyContext cpsMod
       print graph
+      print (isTailRecursive name graph)

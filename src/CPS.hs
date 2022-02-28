@@ -1,3 +1,13 @@
+{-| CHANGELOG
+
+EVIL HACK FEB 2022: All local bindings are now treated as 0-ary functions.
+Variables are (in general, but with one exception) no longer simple; they 
+need to be "forced" by passing them a continuation.
+
+We have to do this because local definitions may contain function calls, but the
+call graph doesn't record those local function calls properly.
+
+-}
 {-# LANGUAGE TupleSections      #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# Language LambdaCase         #-}
@@ -160,6 +170,10 @@ isSimple (HS.List _ []) = True
 isSimple (HS.Con _ _) = True
 isSimple _         = False
 
+isVar :: HS.Exp l -> Bool
+isVar HS.Var{} = True
+isVar _ = False
+
 -- | Convert an HS.Exp that is simple to a 'SimpleExp'.
 -- Variable names are preserved (as raw vars), but values of constants
 -- are not. See 'SimpleExp'.
@@ -180,21 +194,45 @@ asSimpleExp e | isSimple e = Const
 -- The argument string is a prefix for the fresh var, if one is needed.
 -- That's mostly useful for debugging.
 --
+-- The boolean argument indicates whether we should treat variables as 
+-- functions that need to be "forced". In most places that's the right
+-- behavior - except when the variable is in function call position,
+-- e.g. variable `f` in `f e1 e2`.
+--
 -- E.X. @cpsExp (-e) k@ can be expressed as
 --  @cpsValueM e "v" $ \se -> pure (AppCps (Var "negate") se k)@.
 -- If 'e' is constant this would give @AppCps (Var "negate") Const k@.
 -- If 'e' were, say, @f x@, this would give
 --   @AppCps (Var "f") (Var "x") $ FN v%1 -> AppCps (Var "negate") (Var v%1) k@.
-cpsValueM :: HS.Exp ann -> String -> (SimpleExp -> CPSM CpsExp) -> CPSM CpsExp
-cpsValueM e pre consumer
+_cpsValueM :: HS.Exp ann -> String -> Bool -> (SimpleExp -> CPSM CpsExp) -> CPSM CpsExp
+_cpsValueM e pre shouldForce consumer
+  -- This is a total hack.
+  -- Since we treat all local definitions as functions that take a continuation,
+  -- we now need to do a little pre-processing step where we apply the 
+  -- variable to a dummy argument. We then perform a CPS transform on the app.
+  -- This gives us the desired behavior where `f x y` is transformed into
+  -- `y (\y' -> x (\x' -> f k x' y'))`.
+  | isVar e && shouldForce =
+    do v <- freshCPS pre
+       contBody <- consumer (mkUnqVar v)
+       let anyConstant = HS.Lit undefined $ HS.Int undefined 0 "0"
+       cpsExp (HS.App undefined e anyConstant) $ FnCont v contBody
+  -- Continue on with CPS as usual
   | isSimple e = consumer (asSimpleExp e)
-  | otherwise  = do v <- freshCPS pre
-                    contBody <- consumer (mkUnqVar v)
-                    cpsExp e $ FnCont v contBody
+  | otherwise   = do v <- freshCPS pre
+                     contBody <- consumer (mkUnqVar v)
+                     cpsExp e $ FnCont v contBody
+
+cpsValueM :: HS.Exp ann -> String -> (SimpleExp -> CPSM CpsExp) -> CPSM CpsExp
+cpsValueM e pre = _cpsValueM e pre True
 
 -- | 'cpsValueM', but in this simple case where the consumer is pure.
 cpsValue :: HS.Exp ann -> String -> (SimpleExp -> CpsExp) -> CPSM CpsExp
 cpsValue e pre consumer = cpsValueM e pre (pure . consumer)
+
+-- | 'cpsValue', but without forcing variables.
+cpsValue' :: HS.Exp ann -> String -> (SimpleExp -> CpsExp) -> CPSM CpsExp
+cpsValue' e pre consumer = _cpsValueM e pre False (pure . consumer)
 
 {- Note: [cpsExp Structure]
 Below, cases are presented in the same order as the HS.Exp documentation.
@@ -415,7 +453,7 @@ collectApp = go
 rebuildApp :: HS.Exp ann -> [HS.Exp ann] -> CpsCont -> CPSM CpsExp
 rebuildApp head args k = go [] args
   where
-    go seArgs []  = cpsValue head "f" $ \se -> AppCps se seArgs k
+    go seArgs []  = cpsValue' head "f" $ \se -> AppCps se seArgs k
     go acc (x:xs) = cpsValueM x "a" $ \se -> go (se:acc) xs
 
 -- | Collect a list of GuardedRhss into a list of guard
