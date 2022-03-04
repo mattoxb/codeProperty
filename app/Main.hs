@@ -1,13 +1,14 @@
 module Main where
 
-import Lib (testModuleFromFile)
 import System.Environment (getArgs)
+import PropLib
 
 main :: IO ()
 main = do
   args <- getArgs
   result <- case args of
     []      -> error "CodeProperty: no file"
-    [fpath] -> pure True
-    (fpath : names) -> testModuleFromFile fpath names
+    [name, file] -> testModuleFromFile file name
+    _ -> error "Too many args"
+    -- (fpath : names) -> testModuleFromFile fpath names
   print result

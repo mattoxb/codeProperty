@@ -1,12 +1,13 @@
-module Lib where
+module PropLib where
 
 import Data.Functor (void)
 import System.FilePath (takeFileName)
 
 import qualified Language.Haskell.Exts as HS
 import ContainsListComp (containsListComp)
-import TailRecursion (tailRecursiveInModule)
+import TailRecursion (Truth (Fails))
 import CPS (CpsModule, Name, renameModule, cpsTransformModule)
+import CallGraph
 
 -- | Process a parsed Haskell module to make it suitable for use in the
 -- tail recursion checker.
@@ -28,12 +29,16 @@ getModuleSource fpath = do
   fileContents <- readFile fpath
   return $ ModSrc (takeFileName fpath) fileContents
 
-testModule :: HS.Module () -> [Name] -> Bool
-testModule mod names = case processModule mod of
-  Nothing -> False
-  Just cpsMod -> tailRecursiveInModule cpsMod names
-
-testModuleFromFile :: FilePath -> [Name] -> IO Bool
-testModuleFromFile fpath names = do
-  modsrc <- getModuleSource fpath
-  return $ testModule (parseModuleSource modsrc) names
+testModuleFromFile :: FilePath -> Name -> IO Truth
+testModuleFromFile fpath name = do
+  modsrc@(ModSrc _ contents) <- getModuleSource fpath
+  -- putStrLn contents
+  let mod = parseModuleSource modsrc
+  case processModule mod of
+    Nothing ->
+      return Fails
+    Just cpsMod -> do
+      let (graph, _) = buildGraph emptyContext cpsMod
+      -- print cpsMod
+      -- print graph
+      return $ isTailRecursive name graph
