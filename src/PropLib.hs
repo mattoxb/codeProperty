@@ -1,4 +1,4 @@
-module Lib where
+module PropLib where
 
 import Data.Functor (void)
 import System.FilePath (takeFileName)
