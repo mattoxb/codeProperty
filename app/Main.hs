@@ -8,6 +8,7 @@ main = do
   args <- getArgs
   result <- case args of
     []      -> error "CodeProperty: no file"
-    xs -> mapM (\x -> print x >> graphFromFile x "fact") xs
+    [name, file] -> testModuleFromFile file name
+    _ -> error "Too many args"
     -- (fpath : names) -> testModuleFromFile fpath names
   print result

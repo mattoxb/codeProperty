@@ -5,7 +5,7 @@ import System.FilePath (takeFileName)
 
 import qualified Language.Haskell.Exts as HS
 import ContainsListComp (containsListComp)
-import TailRecursion (tailRecursiveInModule)
+import TailRecursion (Truth (Fails))
 import CPS (CpsModule, Name, renameModule, cpsTransformModule)
 import CallGraph
 
@@ -29,25 +29,16 @@ getModuleSource fpath = do
   fileContents <- readFile fpath
   return $ ModSrc (takeFileName fpath) fileContents
 
-testModule :: HS.Module () -> [Name] -> Bool
-testModule mod names = case processModule mod of
-  Nothing -> False
-  Just cpsMod -> tailRecursiveInModule cpsMod names
-
-testModuleFromFile :: FilePath -> [Name] -> IO Bool
-testModuleFromFile fpath names = do
-  modsrc <- getModuleSource fpath
-  return $ testModule (parseModuleSource modsrc) names
-
-graphFromFile :: FilePath -> Name -> IO ()
-graphFromFile fpath name = do
+testModuleFromFile :: FilePath -> Name -> IO Truth
+testModuleFromFile fpath name = do
   modsrc@(ModSrc _ contents) <- getModuleSource fpath
-  putStrLn contents
+  -- putStrLn contents
   let mod = parseModuleSource modsrc
   case processModule mod of
-    Nothing -> return ()
+    Nothing ->
+      return Fails
     Just cpsMod -> do
-      print cpsMod
-      let (graph, ctx) = buildGraph emptyContext cpsMod
-      print graph
-      print (isTailRecursive name graph)
+      let (graph, _) = buildGraph emptyContext cpsMod
+      -- print cpsMod
+      -- print graph
+      return $ isTailRecursive name graph

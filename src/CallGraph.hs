@@ -3,6 +3,57 @@ import CPS
 import Data.List
 import TailRecursion
 
+{-
+
+Let $f$ be the function we are checking for tail recursion.
+
+We need to distinguish the following common situations: 
+1.  $f$ can make non-tail calls to a helper function $g$ as long as $g$ does not
+recurse back to $f$. If $g$ does recurse back to $f$, then $f$ fails the check.
+2. $f$ can tail-recursively call an "aux" function $g$, as long as $g$ is tail
+recursive itself. If $g$ is bad-recursive, then $f$ fails the check.
+
+```haskell
+-- good, even though f makes a non-tail call
+helper n = n - 1 f n = if n < 0 then n else f (helper n)
+
+-- good, the helper function is tail recursive
+f n = aux n 1 where aux n acc = if n == 0 then acc else aux (n - 1) (n * acc)
+
+-- bad, the helper function is not tail recursive
+f n = aux n where aux n = if n == 0 then 1 else n * aux (n - 1) 
+```
+
+Hence we should inspect the entire program call graph in order to decide whether
+$f$ is tail recursive.
+
+# Definitions
+
+$f \to_1 g$ denotes "$f$ makes a non-tail call to $g$".  $f \to_2 g$ denotes
+"$f$ makes a tail call to $g$".  $f \to g$ denotes "$f$ makes some sort of call
+to $g$".
+
+We say $f$ **can reach** $g$ if $f \to^* g$.
+
+Let $G$ be the call graph, where edges are labelled with 1 or 2, according to
+the notation above.
+
+If $C$ is a strongly connected component and one of the edges is a non-tail
+call, then $C$ is a **bad component**. Otherwise, $C$ is a **good component**.
+
+$f$ **fails** if it can reach a bad component. $f$ **passes** if it can reach a
+good component and can't reach any bad components.
+
+A module passes the check if the desired function passes, and all other
+functions don't fail.
+
+# Algorithm
+
+1. Compute the SCCs of $G$ 2. Mark each SCC as either bad or good 3. If $f$ can
+reach a bad component, then $f$ **fails**. Otherwise, if $f$ can reach a
+nontrivial (size > 1) component, then $f$ **passes**. Otherwise, $f$ is vacuous.
+-}
+
 ------------
 -- GRAPHS --
 ------------
